@@ -179,6 +179,7 @@ export class PiAgent {
     this.startedAt = Date.now();
     this.lastActivity = this.startedAt;
     this.state = "running";
+    this.writeChain = Promise.resolve();
     if (!this.logPath && this.logDir) {
       try {
         mkdirSync(this.logDir, { recursive: true });
@@ -204,7 +205,9 @@ export class PiAgent {
           this.readyReject = null;
           this.readyResolve = null;
         }
-        this.state = "dead";
+        if (this.state !== "idle") {
+          this.state = this.sessionId ? "idle" : "dead";
+        }
       });
     });
 
@@ -249,7 +252,7 @@ export class PiAgent {
     const timeoutMs = opts.timeoutMs ?? 5000;
     const force = opts.force ?? false;
 
-    if (proc.exitCode === null) {
+    if (proc.exitCode === null && proc.signalCode === null) {
       if (!force) {
         try {
           await this.sendRaw({ type: "abort" }, { wait: false });
@@ -527,7 +530,7 @@ export class PiAgent {
 
   private async safeWrite(frame: Frame): Promise<void> {
     const proc = this.proc;
-    if (!proc || proc.exitCode !== null) return;
+    if (!proc || proc.exitCode !== null || proc.signalCode !== null) return;
     const bytes = encode(frame);
     this.writeChain = this.writeChain.then(async () => {
       const sink = proc.stdin as Bun.FileSink;

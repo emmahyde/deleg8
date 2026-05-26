@@ -121,7 +121,7 @@ server.registerTool(
         })
         .optional()
         .describe("Optional `set_model` frame sent before initial_prompt."),
-      extra_args: z.array(z.string()).optional().describe("Extra CLI args appended after `--no-session`."),
+      extra_args: z.array(z.string()).optional().describe("Extra CLI args appended to the omp spawn command."),
       cwd: z.string().optional().describe("Working directory for the omp subprocess."),
       rpc_mode: z
         .enum(["rpc", "rpc-ui"])
