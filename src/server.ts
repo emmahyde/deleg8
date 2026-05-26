@@ -52,6 +52,29 @@ function registerTools(server: McpServer, registry: AgentRegistry): void {
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
+function buildMonitorCmd(agentId: string, logPath: string): string {
+  // Generates a bash command for Claude Code's Monitor tool. It:
+  //   1. tail -f the NDJSON log
+  //   2. waits for an agent_end frame
+  //   3. extracts the last assistant message_end text from the full log
+  //   4. prints a one-line summary and exits
+  // Each stdout line becomes a Monitor notification.
+  const lp = logPath.replace(/'/g, "'\\''");
+  return [
+    `tail -n +1 -f '${lp}'`,
+    `| while IFS= read -r line; do`,
+    `  if printf '%s' "$line" | grep -q '"type":"agent_end"'; then`,
+    `    last_text=$(grep '"type":"message_end"' '${lp}'`,
+    `      | grep '"role":"assistant"'`,
+    `      | tail -1`,
+    `      | jq -r '[.message.content[]? | select(.type=="text") | .text] | join("")' 2>/dev/null);`,
+    `    echo "[pi-agent ${agentId}] done: $last_text";`,
+    `    exit 0;`,
+    `  fi;`,
+    `done`,
+  ].join(" ");
+}
+
 const MAX_RESULT_BYTES = 32 * 1024;
 
 function ok(value: unknown, text?: string) {
@@ -164,11 +187,15 @@ server.registerTool(
           });
         }
       }
-      return ok({
+      const result: Record<string, unknown> = {
         agent_id: agent.agentId,
         status: agent.status(),
         response,
-      });
+      };
+      if (args.background && agent.getLogPath()) {
+        result.monitor_cmd = buildMonitorCmd(agent.agentId, agent.getLogPath()!);
+      }
+      return ok(result);
     }),
 );
 
@@ -205,7 +232,15 @@ server.registerTool(
       const agent = registry.get(args.agent_id);
       if (args.background) {
         await agent.sendPrompt(args.message, { wait: false });
-        return ok({ agent_id: args.agent_id, dispatched: true, status: agent.status() });
+        const result: Record<string, unknown> = {
+          agent_id: args.agent_id,
+          dispatched: true,
+          status: agent.status(),
+        };
+        if (agent.getLogPath()) {
+          result.monitor_cmd = buildMonitorCmd(args.agent_id, agent.getLogPath()!);
+        }
+        return ok(result);
       }
       const response = await agent.sendPrompt(args.message, {
         wait: true,
