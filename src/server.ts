@@ -3,6 +3,7 @@
 // long-lived subagents addressable from Claude Code.
 
 import { randomUUID } from "node:crypto";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -51,6 +52,26 @@ export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentSer
 function registerTools(server: McpServer, registry: AgentRegistry): void {
 
 // ── helpers ─────────────────────────────────────────────────────────────
+
+function collectClaudeMd(cwd?: string): string {
+  const paths = [join(homedir(), ".claude", "CLAUDE.md")];
+  if (cwd) {
+    paths.push(join(cwd, "CLAUDE.md"));
+    paths.push(join(cwd, ".claude", "CLAUDE.md"));
+  }
+  const blocks: string[] = [];
+  for (const p of paths) {
+    try {
+      if (existsSync(p)) {
+        const content = readFileSync(p, "utf8").trim();
+        if (content) blocks.push(`<claude-md source="${p}">\n${content}\n</claude-md>`);
+      }
+    } catch { /* skip unreadable */ }
+  }
+  return blocks.length > 0
+    ? blocks.join("\n\n") + "\n\n---\n\n"
+    : "";
+}
 
 function buildMonitorCmd(agentId: string, logPath: string): string {
   // Generates a bash command for Claude Code's Monitor tool. It:
@@ -176,12 +197,14 @@ server.registerTool(
         rpcMode: args.rpc_mode,
       });
       if (args.model) await agent.setModel(args.model.provider, args.model.modelId);
+      const claudeMdPrefix = collectClaudeMd(args.cwd);
       let response: unknown = null;
       if (args.initial_prompt) {
+        const prompt = claudeMdPrefix + args.initial_prompt;
         if (args.background) {
-          await agent.sendPrompt(args.initial_prompt, { wait: false });
+          await agent.sendPrompt(prompt, { wait: false });
         } else {
-          response = await agent.sendPrompt(args.initial_prompt, {
+          response = await agent.sendPrompt(prompt, {
             wait: true,
             timeoutMs: args.timeout_ms,
           });

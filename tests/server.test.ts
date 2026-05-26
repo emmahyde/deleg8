@@ -103,7 +103,7 @@ describe("pi-agent MCP server integration", () => {
       });
       const spawned = callJson(spawnRes as any);
       expect(spawned.agent_id).toBe("int-1");
-      expect(spawned.response.data.echo).toBe("first");
+      expect(spawned.response.data.echo).toContain("first");
 
       // Auto-suspend kicks in after turn_end; wait for it.
       await waitFor(async () => {
