@@ -200,7 +200,7 @@ describe("PiAgent over mock omp", () => {
 describe("PiAgent lifecycle (session + suspend/resume)", () => {
   const tempDirs: string[] = [];
   function makeSessionDir(): string {
-    const d = mkdtempSync(join(tmpdir(), "pi-agent-test-"));
+    const d = mkdtempSync(join(tmpdir(), "deleg8-test-"));
     tempDirs.push(d);
     return d;
   }

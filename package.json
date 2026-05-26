@@ -1,15 +1,15 @@
 {
-  "name": "pi-agent-mcp",
+  "name": "deleg8",
   "version": "0.1.0",
   "description": "MCP server that wraps oh-my-pi (`omp --mode rpc`) as named, persistent subagents addressable from Claude Code.",
   "type": "module",
   "bin": {
-    "pi-agent-mcp": "./src/server.ts"
+    "deleg8": "./src/server.ts"
   },
   "scripts": {
     "start": "bun run src/server.ts",
     "dev": "bun --watch src/server.ts",
-    "build": "bun build src/server.ts --target=bun --outfile=dist/pi-agent-mcp.js",
+    "build": "bun build src/server.ts --target=bun --outfile=dist/deleg8.js",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "inspector": "bunx @modelcontextprotocol/inspector bun run src/server.ts"

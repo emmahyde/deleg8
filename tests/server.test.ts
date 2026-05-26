@@ -1,7 +1,7 @@
 // Integration test for the MCP layer: real McpServer + Client over an
 // in-memory transport, wired to a registry whose binary is mock-omp. Verifies
 // the full pi_spawn → pi_send → auto-suspend → pi_send-resumes flow that
-// pi-agent's resumable lifecycle promises.
+// deleg8's resumable lifecycle promises.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -84,7 +84,7 @@ async function makeHarness(): Promise<Harness> {
   };
 }
 
-describe("pi-agent MCP server integration", () => {
+describe("deleg8 MCP server integration", () => {
   const harnesses: Harness[] = [];
   afterEach(async () => {
     for (const h of harnesses.splice(0)) await h.close();

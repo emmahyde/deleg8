@@ -1,28 +1,27 @@
-# pi-agent-mcp
+# deleg8
 
-An MCP server that exposes [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp --mode rpc`) as a fleet of **named, long-lived subagents** addressable from Claude Code — mirroring the surface of the native `Agent` + `SendMessage` tools.
+An MCP server that exposes [oh-my-pi](https://github.com/can1357/oh-my-pi) (`omp --mode rpc`) as a fleet of **named, resumable subagents** addressable from Claude Code — mirroring the surface of the native `Agent` + `SendMessage` tools.
 
-Each agent is one `omp --mode rpc --no-session` subprocess. `pi_send` writes another `prompt` frame to the same subprocess's stdin, so conversation context persists across calls. Multiple agents run concurrently under different IDs.
+Each agent is an `omp --mode rpc-ui` subprocess with session persistence. Agents auto-suspend after completing their work (`agent_end`) and transparently resume via `--resume <sessionId>` on the next `pi_send`, preserving full conversation context across pauses. Multiple agents run concurrently under different IDs.
 
 ## Why
 
-Claude Code's native `Agent` / `SendMessage` lets you spawn sub-Claude sessions and resume them by ID. This server gives you the same primitive for `omp`: spawn it once, keep pushing prompts at it, read its output, kill it when done.
+Claude Code's native `Agent` / `SendMessage` lets you spawn sub-Claude sessions and resume them by ID. This server gives you the same primitive for `omp`: spawn it once, keep pushing prompts at it, read its output, kill it when done. Agents inherit your `CLAUDE.md` preferences automatically.
 
 ## Install
 
 ```bash
-cd pi-agent-mcp
 bun install
 ```
 
-Then wire it into Claude Code. **User-level** (`~/.claude.json`, applies everywhere):
+Then wire it into Claude Code. **User-level** (`~/.mcp.json`, applies everywhere):
 
 ```jsonc
 {
   "mcpServers": {
-    "pi-agent": {
+    "deleg8": {
       "command": "bun",
-      "args": ["run", "/Users/you/projects/deleg8/pi-agent-mcp/src/server.ts"]
+      "args": ["run", "/path/to/deleg8/src/server.ts"]
     }
   }
 }
@@ -33,9 +32,9 @@ Or **project-level** (`.mcp.json` in the project root, committed for the team):
 ```jsonc
 {
   "mcpServers": {
-    "pi-agent": {
+    "deleg8": {
       "command": "bun",
-      "args": ["run", "./pi-agent-mcp/src/server.ts"],
+      "args": ["run", "./src/server.ts"],
       "env": { "OMP_BIN": "omp" }
     }
   }
@@ -49,21 +48,38 @@ Set `OMP_BIN` if `omp` isn't on the spawning shell's `PATH` (e.g. `/Users/you/.b
 | Tool        | Mirrors             | Purpose                                                          |
 |-------------|---------------------|------------------------------------------------------------------|
 | `pi_spawn`  | `Agent`             | Launch a new `omp` subprocess, optionally send first prompt      |
-| `pi_send`   | `SendMessage`       | Send another prompt to an existing agent_id (resumes context)    |
-| `pi_list`   | `TaskList`          | List every registered agent and its status                       |
+| `pi_send`   | `SendMessage`       | Send another prompt to an existing agent (auto-resumes if idle)  |
+| `pi_list`   | `TaskList`          | List every registered agent and its state                        |
 | `pi_status` | `TaskGet`           | Detailed status for one agent                                    |
-| `pi_output` | `TaskOutput`        | Read buffered NDJSON frames (response/event/tool-call frames)    |
-| `pi_stop`   | `TaskStop`          | Send `abort`, terminate (or SIGKILL with `force: true`)          |
+| `pi_output` | `TaskOutput`        | Read buffered frames (digest/summary/raw with jq projection)     |
+| `pi_stop`   | `TaskStop`          | Send `abort`, terminate, remove from registry                    |
+| `pi_prune`  | —                   | Drop dead/idle agents from the registry                          |
 
-All tools that "act" (`pi_spawn`, `pi_send`) support `background: true` to return immediately; poll `pi_output` with `since_seq` to stream results.
+### Background mode + Monitor
+
+`pi_spawn` and `pi_send` support `background: true` to return immediately. The response includes a `monitor_cmd` — a bash one-liner you can pass to Claude Code's `Monitor` tool. It tails the NDJSON log, waits for `agent_end`, extracts the final assistant message, and prints it. You get an automatic notification when the agent finishes.
+
+### Agent lifecycle
+
+```
+pi_spawn → running → (tool calls, thinking) → agent_end → idle (proc killed, session on disk)
+                                                              ↓
+pi_send  → resume (--resume <sessionId>) → running → ... → agent_end → idle
+                                                              ↓
+pi_stop  → removed from registry
+```
 
 ### Clarifying questions (MCP elicitation)
 
-Agents spawn in `--mode rpc-ui` by default, which lets omp emit `extension_ui_request` frames mid-turn — the same channel its `ask` tool and structured pickers use. The wrapper bridges these to **MCP elicitation** (`elicitInput`), so Claude Code surfaces the question to you and forwards your answer back into the same long-lived omp process. Methods translated: `select` (enum), `confirm` (boolean), `input` (string), `editor` (multi-line string). Passive UI frames (`notify`, `setStatus`, `setWidget`, etc.) are buffered silently. Pass `rpc_mode: "rpc"` on spawn to disable.
+Agents spawn in `--mode rpc-ui` by default, which lets omp emit `extension_ui_request` frames mid-turn. The wrapper bridges these to **MCP elicitation** (`elicitInput`), so Claude Code surfaces the question to you and forwards your answer back. Methods: `select`, `confirm`, `input`, `editor`. Pass `rpc_mode: "rpc"` to disable.
+
+### CLAUDE.md injection
+
+On `pi_spawn`, the server reads `~/.claude/CLAUDE.md` (user-level) and `<cwd>/CLAUDE.md` or `<cwd>/.claude/CLAUDE.md` (project-level) and prepends them to the initial prompt. Agents inherit your conventions automatically.
 
 ### Frame model
 
-The RPC mode of `omp` speaks NDJSON over stdio. From their README:
+omp speaks NDJSON over stdio:
 
 ```
 > {"id":"r1","type":"prompt","message":"list .ts files"}
@@ -72,7 +88,7 @@ The RPC mode of `omp` speaks NDJSON over stdio. From their README:
 > {"id":"r3","type":"abort"}
 ```
 
-This server generates frame IDs and correlates `response` frames back to their originating request. Every frame received is also buffered (cap: 1024) for `pi_output`.
+Frame IDs are auto-generated and correlated. Every frame is buffered (cap: 1024) for `pi_output`. The resource `deleg8://schema/frames` has the full frame catalog + jq examples.
 
 ## Smoke test with MCP Inspector
 
@@ -85,20 +101,22 @@ Opens the [MCP Inspector](https://modelcontextprotocol.io/docs/tools/inspector) 
 1. `pi_spawn` with `initial_prompt: "echo hello"` → returns `agent_id` and response.
 2. `pi_send` with that `agent_id` and `message: "what did I just ask?"` → context is preserved.
 3. `pi_list` → see the agent listed.
-4. `pi_stop` with `remove: true` → clean up.
+4. `pi_stop` → clean up.
 
 ## Development
 
 ```bash
 bun run typecheck   # tsc --noEmit
+bun test            # 55 tests across 7 files
 bun run dev         # bun --watch
 bun run build       # bundle to dist/
 ```
 
 ## Caveats
 
-- Output buffer is bounded at 1024 frames per agent — older frames drop off. Use `pi_output` with `since_seq` to stream incrementally if you care about every frame.
-- `pi_send` with `wait: true` (default) blocks until a `response` frame with the matching `id` arrives. If `omp` emits intermediate event frames they accumulate in the buffer but don't unblock the wait.
-- Elicitation requires the MCP client to support the 2025-06-18 `elicitation/create` request. Claude Code does; some other clients don't yet — agents spawned in those clients will see UI requests auto-cancel.
-- This wrapper registers no host tools or URI schemes. If omp tries `host_tool_call` / `host_uri_request` it gets an error response so it doesn't hang.
-- The server logs to stderr (never stdout — stdout is the MCP JSON-RPC channel).
+- Output buffer is bounded at 1024 frames per agent — older frames drop off. Use `pi_output` with `since_seq` to stream incrementally.
+- `pi_send` with `wait: true` (default) blocks until a `response` frame arrives. Intermediate event frames accumulate in the buffer.
+- Elicitation requires the MCP client to support `elicitation/create`. Claude Code does; some other clients don't yet.
+- The server registers no host tools or URI schemes. If omp tries `host_tool_call` / `host_uri_request` it gets an error response.
+- Logs go to stderr (never stdout — stdout is the MCP JSON-RPC channel).
+- Session logs live at `~/.claude/deleg8/<session>/<agent_id>.log`.

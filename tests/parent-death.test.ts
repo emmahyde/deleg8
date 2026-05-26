@@ -43,7 +43,7 @@ describe("parent-death cleanup", () => {
   test(
     "SIGTERM on the server kills spawned omp grandchildren",
     async () => {
-      const logDir = mkdtempSync(join(tmpdir(), "pi-death-test-"));
+      const logDir = mkdtempSync(join(tmpdir(), "deleg8-death-test-"));
       tempDirs.push(logDir);
 
       // mock-omp.ts has `#!/usr/bin/env bun` + chmod +x, so OMP_BIN can point
@@ -56,7 +56,7 @@ describe("parent-death cleanup", () => {
           ...(process.env as Record<string, string>),
           OMP_BIN: MOCK_PATH,
           CLAUDE_SESSION_ID: "death-smoke",
-          PI_AGENT_LOG_DIR: logDir,
+          DELEG8_LOG_DIR: logDir,
         },
       });
       const client = new Client({ name: "death-test", version: "0.0.1" });

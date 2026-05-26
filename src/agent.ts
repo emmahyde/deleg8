@@ -146,7 +146,7 @@ export class PiAgent {
       try {
         mkdirSync(this.sessionDir, { recursive: true });
       } catch (e) {
-        console.error(`pi-agent: could not create session dir ${this.sessionDir}:`, (e as Error).message);
+        console.error(`deleg8: could not create session dir ${this.sessionDir}:`, (e as Error).message);
       }
       args.push("--session-dir", this.sessionDir);
     }
@@ -185,7 +185,7 @@ export class PiAgent {
         mkdirSync(this.logDir, { recursive: true });
         this.logPath = join(this.logDir, `${this.agentId}.log`);
       } catch (e) {
-        console.error(`pi-agent: could not create log dir ${this.logDir}:`, (e as Error).message);
+        console.error(`deleg8: could not create log dir ${this.logDir}:`, (e as Error).message);
       }
     }
     this.whenReady = new Promise<void>((resolve, reject) => {
@@ -241,7 +241,7 @@ export class PiAgent {
       const isShutdownRace =
         msg === "agent process exited" || msg.startsWith(`agent ${this.agentId} exited with code`);
       if (!isShutdownRace) {
-        console.error(`pi-agent: get_state failed for ${this.agentId}:`, msg);
+        console.error(`deleg8: get_state failed for ${this.agentId}:`, msg);
       }
     }
   }
@@ -516,14 +516,14 @@ export class PiAgent {
         type: "host_tool_result",
         id,
         isError: true,
-        result: { error: "pi-agent-mcp registered no host tools" },
+        result: { error: "deleg8 registered no host tools" },
       });
     } else if (request.type === "host_uri_request") {
       await this.safeWrite({
         type: "host_uri_result",
         id,
         isError: true,
-        error: "pi-agent-mcp registered no host URI schemes",
+        error: "deleg8 registered no host URI schemes",
       });
     }
   }

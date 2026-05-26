@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-// pi-agent-mcp — exposes oh-my-pi (`omp --mode rpc`) as a fleet of named,
+// deleg8 — exposes oh-my-pi (`omp --mode rpc`) as a fleet of named,
 // long-lived subagents addressable from Claude Code.
 
 import { randomUUID } from "node:crypto";
@@ -33,11 +33,11 @@ export interface PiAgentServerHandle {
 }
 
 export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentServerHandle {
-  const server = new McpServer({ name: "pi-agent", version: "0.1.0" });
+  const server = new McpServer({ name: "deleg8", version: "0.1.0" });
   // Per-Claude-Code-session log directory. CLAUDE_SESSION_ID is preferred so
   // logs from the same session land together; otherwise a short generated id.
   const sessionId = process.env.CLAUDE_SESSION_ID ?? randomUUID().slice(0, 8);
-  const defaultLogDir = join(homedir(), ".claude", "pi-agents", sessionId);
+  const defaultLogDir = join(homedir(), ".claude", "deleg8", sessionId);
   const registry =
     opts.registry ??
     new AgentRegistry({
@@ -91,7 +91,7 @@ function buildMonitorCmd(agentId: string, logPath: string): string {
     `    last_text=$(tail -r '${lp}'`,
     `      | grep -m1 '"role":"assistant".*"type":"message_end"\\|"type":"message_end".*"role":"assistant"'`,
     `      | jq -r '[.message.content[]? | select(.type=="text") | .text] | join("")' 2>/dev/null);`,
-    `    echo "[pi-agent ${agentId}] done: $last_text";`,
+    `    echo "[deleg8 ${agentId}] done: $last_text";`,
     `    exit 0;`,
     `  fi;`,
     `done`,
@@ -139,7 +139,7 @@ async function project(value: unknown, jq: string | undefined): Promise<unknown>
     cap: MAX_RESULT_BYTES,
     hint:
       "Result exceeds the size cap. Pass (or tighten) a `jq` filter to project " +
-      "only the fields you need. See resource `pi-agent://schema/frames` for the catalog.",
+      "only the fields you need. See resource `deleg8://schema/frames` for the catalog.",
   };
 }
 
@@ -351,7 +351,7 @@ server.registerTool(
       "`format: \"raw\"` returns every NDJSON frame omp emitted, unchanged.\n" +
       "Pass `jq` to project further. Common frame types: `message_end`, `response`, " +
       "`extension_ui_request`. Full catalog + worked jq examples at resource " +
-      "`pi-agent://schema/frames`.",
+      "`deleg8://schema/frames`.",
     inputSchema: {
       agent_id: z.string(),
       format: z
@@ -494,7 +494,7 @@ server.registerTool(
 
 server.registerResource(
   "schema-frames",
-  "pi-agent://schema/frames",
+  "deleg8://schema/frames",
   {
     title: "omp NDJSON frame catalog",
     description:
@@ -519,10 +519,10 @@ server.registerResource(
 
 async function main(): Promise<void> {
   const sessionId = process.env.CLAUDE_SESSION_ID ?? randomUUID().slice(0, 8);
-  // PI_AGENT_LOG_DIR overrides the default ~/.claude/pi-agents/<session>/ path —
+  // DELEG8_LOG_DIR overrides the default ~/.claude/deleg8/<session>/ path —
   // tests use it to keep state inside a tempdir.
   const sessionLogDir =
-    process.env.PI_AGENT_LOG_DIR ?? join(homedir(), ".claude", "pi-agents", sessionId);
+    process.env.DELEG8_LOG_DIR ?? join(homedir(), ".claude", "deleg8", sessionId);
   const { server, registry } = createPiAgentServer({
     binary: process.env.OMP_BIN ?? "omp",
     logDir: sessionLogDir,
@@ -531,7 +531,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   // NOTE: never write to stdout from here — it corrupts the JSON-RPC stream.
   console.error(
-    `pi-agent-mcp ready (binary=${process.env.OMP_BIN ?? "omp"}, session=${sessionId}, logs=${sessionLogDir})`,
+    `deleg8 ready (binary=${process.env.OMP_BIN ?? "omp"}, session=${sessionId}, logs=${sessionLogDir})`,
   );
 
   // Last-resort cleanup: when Claude Code dies (graceful or otherwise), kill every
@@ -545,7 +545,7 @@ async function main(): Promise<void> {
   const shutdown = async (reason: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.error(`pi-agent-mcp shutting down (${reason}), stopping all agents…`);
+    console.error(`deleg8 shutting down (${reason}), stopping all agents…`);
     await registry.stopAll({ force: true });
     process.exit(0);
   };
@@ -569,7 +569,7 @@ async function main(): Promise<void> {
 // Only auto-boot when run as the entrypoint (not when imported by tests).
 if (import.meta.main) {
   main().catch((e) => {
-    console.error("pi-agent-mcp fatal:", e);
+    console.error("deleg8 fatal:", e);
     process.exit(1);
   });
 }
