@@ -1,6 +1,6 @@
 // Integration test for the MCP layer: real McpServer + Client over an
 // in-memory transport, wired to a registry whose binary is mock-omp. Verifies
-// the full pi_spawn → pi_send → auto-suspend → pi_send-resumes flow that
+// the full spawn → send → auto-suspend → send-resumes flow that
 // deleg8's resumable lifecycle promises.
 
 import { afterEach, describe, expect, test } from "bun:test";
@@ -91,14 +91,14 @@ describe("deleg8 MCP server integration", () => {
   });
 
   test(
-    "pi_spawn → pi_send → auto-suspend → pi_send transparently resumes",
+    "spawn → send → auto-suspend → send transparently resumes",
     async () => {
       const h = await makeHarness();
       harnesses.push(h);
 
       // Spawn — first prompt rides on the spawn call.
       const spawnRes = await h.client.callTool({
-        name: "pi_spawn",
+        name: "spawn",
         arguments: { agent_id: "int-1", initial_prompt: "first" },
       });
       const spawned = callJson(spawnRes as any);
@@ -107,12 +107,12 @@ describe("deleg8 MCP server integration", () => {
 
       // Auto-suspend kicks in after turn_end; wait for it.
       await waitFor(async () => {
-        const r = await h.client.callTool({ name: "pi_status", arguments: { agent_id: "int-1" } });
+        const r = await h.client.callTool({ name: "status", arguments: { agent_id: "int-1" } });
         return callJson(r as any).status.state === "idle";
       });
 
       // Snapshot session_id — must survive the resume cycle.
-      const idleStatus = callJson(await h.client.callTool({ name: "pi_status", arguments: { agent_id: "int-1" } }) as any);
+      const idleStatus = callJson(await h.client.callTool({ name: "status", arguments: { agent_id: "int-1" } }) as any);
       expect(idleStatus.status.state).toBe("idle");
       expect(idleStatus.status.session_id).toMatch(/^mock-/);
       const originalSid = idleStatus.status.session_id;
@@ -121,16 +121,16 @@ describe("deleg8 MCP server integration", () => {
       // turn_count reflecting persisted history — if --resume was honored
       // (and session.jsonl was preserved), this is 2.
       const sendRes = await h.client.callTool({
-        name: "pi_send",
+        name: "send",
         arguments: { agent_id: "int-1", message: "COUNT" },
       });
       const sendData = callJson(sendRes as any);
       expect(sendData.response.data.turn_count).toBe(2);
       expect(sendData.status.session_id).toBe(originalSid);
 
-      // Digest from pi_output should reflect both turns.
+      // Digest from output should reflect both turns.
       const outRes = await h.client.callTool({
-        name: "pi_output",
+        name: "output",
         arguments: { agent_id: "int-1", format: "digest" },
       });
       const out = callJson(outRes as any);
@@ -144,13 +144,13 @@ describe("deleg8 MCP server integration", () => {
   );
 
   test(
-    "pi_list reports state and session metadata",
+    "list reports state and session metadata",
     async () => {
       const h = await makeHarness();
       harnesses.push(h);
-      await h.client.callTool({ name: "pi_spawn", arguments: { agent_id: "a1" } });
-      await h.client.callTool({ name: "pi_spawn", arguments: { agent_id: "a2" } });
-      const listRes = await h.client.callTool({ name: "pi_list", arguments: {} });
+      await h.client.callTool({ name: "spawn", arguments: { agent_id: "a1" } });
+      await h.client.callTool({ name: "spawn", arguments: { agent_id: "a2" } });
+      const listRes = await h.client.callTool({ name: "list", arguments: {} });
       const list = callJson(listRes as any);
       expect(list.count).toBe(2);
       const ids = list.agents.map((a: any) => a.agent_id).sort();
@@ -164,24 +164,24 @@ describe("deleg8 MCP server integration", () => {
   );
 
   test(
-    "pi_prune drops dead agents from the registry",
+    "prune drops dead agents from the registry",
     async () => {
       const h = await makeHarness();
       harnesses.push(h);
-      await h.client.callTool({ name: "pi_spawn", arguments: { agent_id: "doomed" } });
+      await h.client.callTool({ name: "spawn", arguments: { agent_id: "doomed" } });
       // Force-stop without remove — leaves a dead entry in the registry.
       await h.client.callTool({
-        name: "pi_stop",
+        name: "stop",
         arguments: { agent_id: "doomed", force: true, remove: false },
       });
       // status should still show the agent (state=dead).
-      const before = callJson(await h.client.callTool({ name: "pi_list", arguments: {} }) as any);
+      const before = callJson(await h.client.callTool({ name: "list", arguments: {} }) as any);
       expect(before.count).toBe(1);
 
-      const pruneRes = await h.client.callTool({ name: "pi_prune", arguments: {} });
+      const pruneRes = await h.client.callTool({ name: "prune", arguments: {} });
       const pruned = callJson(pruneRes as any);
       expect(pruned.removed).toEqual(["doomed"]);
-      const after = callJson(await h.client.callTool({ name: "pi_list", arguments: {} }) as any);
+      const after = callJson(await h.client.callTool({ name: "list", arguments: {} }) as any);
       expect(after.count).toBe(0);
     },
     15_000,

@@ -65,7 +65,7 @@ describe("parent-death cleanup", () => {
       // Spawn an agent. autoSuspend on turn_end would race the test — but we
       // never send a prompt, so no turn_end happens, and the proc stays alive.
       const spawnRes = await client.callTool({
-        name: "pi_spawn",
+        name: "spawn",
         arguments: { agent_id: "victim" },
       });
       const spawnText = (spawnRes as any).content?.[0]?.text ?? JSON.stringify((spawnRes as any).structuredContent);

@@ -143,16 +143,16 @@ async function project(value: unknown, jq: string | undefined): Promise<unknown>
   };
 }
 
-// ── pi_spawn ────────────────────────────────────────────────────────────
+// ── spawn ────────────────────────────────────────────────────────────
 
 server.registerTool(
-  "pi_spawn",
+  "spawn",
   {
     title: "Spawn pi subagent",
     description:
       "Launch a new `omp --mode rpc` subprocess and register it under `agent_id`. " +
       "Mirrors the native Agent tool: optionally send `initial_prompt` and wait for the response. " +
-      "Set `background: true` to return the agent_id immediately and stream output via pi_output later.",
+      "Set `background: true` to return the agent_id immediately and stream output via output later.",
     inputSchema: {
       agent_id: z
         .string()
@@ -224,19 +224,19 @@ server.registerTool(
     }),
 );
 
-// ── pi_send ─────────────────────────────────────────────────────────────
+// ── send ─────────────────────────────────────────────────────────────
 
 server.registerTool(
-  "pi_send",
+  "send",
   {
     title: "Send message to existing pi agent",
     description:
       "Equivalent of SendMessage({to: agent_id, prompt: message}). If the agent is idle " +
-      "(auto-suspended at last turn_end), pi_send transparently respawns omp with " +
+      "(auto-suspended at last turn_end), send transparently respawns omp with " +
       "--resume <session_id> so conversation context is preserved across pauses. " +
       "Targets the existing agent_id — does NOT create a new agent.",
     inputSchema: {
-      agent_id: z.string().describe("Target agent_id (from pi_spawn or pi_list)."),
+      agent_id: z.string().describe("Target agent_id (from spawn or list)."),
       message: z.string().min(1).describe("Prompt to send."),
       background: z
         .boolean()
@@ -275,17 +275,17 @@ server.registerTool(
     }),
 );
 
-// ── pi_list ─────────────────────────────────────────────────────────────
+// ── list ─────────────────────────────────────────────────────────────
 
 server.registerTool(
-  "pi_list",
+  "list",
   {
     title: "List pi subagents",
     description:
       "Snapshot of every registered pi agent. Each entry has `state` (running | idle | dead) " +
       "and `session_id`. `idle` means the subprocess has exited at end-of-turn but the omp " +
-      "session is on disk and resumable via pi_send. `dead` means the agent crashed or was " +
-      "stopped — registry entry persists for inspection until pi_prune. Mirrors TaskList. " +
+      "session is on disk and resumable via send. `dead` means the agent crashed or was " +
+      "stopped — registry entry persists for inspection until prune. Mirrors TaskList. " +
       "Pass `jq` to project (e.g. `.agents | map({id: .agent_id, state})`).",
     inputSchema: {
       jq: z.string().optional().describe("Optional jq -c filter applied to the structured result."),
@@ -306,10 +306,10 @@ server.registerTool(
     }),
 );
 
-// ── pi_status ───────────────────────────────────────────────────────────
+// ── status ───────────────────────────────────────────────────────────
 
 server.registerTool(
-  "pi_status",
+  "status",
   {
     title: "Get status of one pi subagent",
     description:
@@ -336,10 +336,10 @@ server.registerTool(
     }),
 );
 
-// ── pi_output ───────────────────────────────────────────────────────────
+// ── output ───────────────────────────────────────────────────────────
 
 server.registerTool(
-  "pi_output",
+  "output",
   {
     title: "Read buffered frames from a pi subagent",
     description:
@@ -426,10 +426,10 @@ server.registerTool(
     }),
 );
 
-// ── pi_stop ─────────────────────────────────────────────────────────────
+// ── stop ─────────────────────────────────────────────────────────────
 
 server.registerTool(
-  "pi_stop",
+  "stop",
   {
     title: "Stop a pi subagent",
     description:
@@ -458,10 +458,10 @@ server.registerTool(
     }),
 );
 
-// ── pi_prune ────────────────────────────────────────────────────────────
+// ── prune ────────────────────────────────────────────────────────────
 
 server.registerTool(
-  "pi_prune",
+  "prune",
   {
     title: "Drop terminal pi subagents from the registry",
     description:
@@ -498,7 +498,7 @@ server.registerResource(
   {
     title: "omp NDJSON frame catalog",
     description:
-      "Frame types pi_output may return, plus message-block shapes and worked jq examples. " +
+      "Frame types output may return, plus message-block shapes and worked jq examples. " +
       "Read this before writing a non-trivial jq filter against `format: \"raw\"`.",
     mimeType: "application/json",
   },
