@@ -81,13 +81,15 @@ function buildMonitorCmd(agentId: string, logPath: string): string {
   //   4. prints a one-line summary and exits
   // Each stdout line becomes a Monitor notification.
   const lp = logPath.replace(/'/g, "'\\''");
+  // tail -f the log; on agent_end, read the file backwards to find the last
+  // assistant message_end, extract text blocks via jq, print, and exit.
+  // tac + grep -m1 avoids racing with tail's open file handle.
   return [
     `tail -n +1 -f '${lp}'`,
     `| while IFS= read -r line; do`,
     `  if printf '%s' "$line" | grep -q '"type":"agent_end"'; then`,
-    `    last_text=$(grep '"type":"message_end"' '${lp}'`,
-    `      | grep '"role":"assistant"'`,
-    `      | tail -1`,
+    `    last_text=$(tail -r '${lp}'`,
+    `      | grep -m1 '"role":"assistant".*"type":"message_end"\\|"type":"message_end".*"role":"assistant"'`,
     `      | jq -r '[.message.content[]? | select(.type=="text") | .text] | join("")' 2>/dev/null);`,
     `    echo "[pi-agent ${agentId}] done: $last_text";`,
     `    exit 0;`,
