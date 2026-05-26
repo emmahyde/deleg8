@@ -441,10 +441,10 @@ export class PiAgent {
       return;
     }
 
-    if (ftype === "turn_end" && this.autoSuspend && this.state === "running" && this.sessionId) {
-      // Flip state synchronously so any in-flight sendPrompt sees "idle"
-      // before dispatching to a soon-to-die proc. The actual subprocess kill
-      // runs in the background and is awaited by resume().
+    if (ftype === "agent_end" && this.autoSuspend && this.state === "running" && this.sessionId && this.sessionDir) {
+      // agent_end fires once after omp's full agentic loop completes (all
+      // tool-call cycles done). turn_end fires after each individual cycle
+      // and is NOT a completion signal.
       this.state = "idle";
       this.suspendTask = this.suspendProc();
       return;

@@ -3,7 +3,7 @@
 //
 // Protocol mirrors the subset of omp's rpc-ui surface the wrapper uses:
 //   ready (emitted on boot, no id)
-//   prompt          -> response with data, then turn_end
+//   prompt          -> response with data, then turn_end + agent_end
 //   set_model       -> silently acknowledged
 //   abort           -> process.exit(0)
 //   get_state       -> response with {sessionId, sessionFile}
@@ -98,6 +98,7 @@ function finishTurn(promptId: string, userMessage: string, data: Frame): void {
   persistTurn({ turn: turnCount, message: userMessage, data });
   write({ type: "response", id: promptId, command: "prompt", success: true, data });
   write({ type: "turn_end" });
+  write({ type: "agent_end" });
 }
 
 for await (const line of readLines(Bun.stdin.stream())) {
