@@ -44,8 +44,6 @@ export interface AgentStatus {
   denied_count: number;
   /** Number of file writes outside declared scope. */
   scope_violations: number;
-  /** Shared context preamble (if set). */
-  preamble: string | null;
 }
 
 export interface BufferedFrame {
@@ -189,6 +187,12 @@ export interface PiAgentOptions {
    * write-scope constraint. The deleg8 server wires this to channel notifications.
    */
   onViolation?: (agentId: string, type: "denied" | "scope", detail: Record<string, unknown>) => void;
+  /**
+   * Called before resume() respawns the subprocess; throw to refuse. The
+   * registry wires this to its capacity/memory gate so resumed agents count
+   * against the same cap as fresh spawns.
+   */
+  preResumeGate?: () => void;
 }
 
 export class PiAgent {
@@ -275,6 +279,9 @@ export class PiAgent {
    */
   onViolation?: (agentId: string, type: "denied" | "scope", detail: Record<string, unknown>) => void;
 
+  /** Capacity gate run before resume() respawns the subprocess. See PiAgentOptions.preResumeGate. */
+  private readonly preResumeGate: (() => void) | undefined;
+
   constructor(agentId: string, opts: PiAgentOptions = {}) {
     this.agentId = agentId;
     this.binary = opts.binary ?? "omp";
@@ -293,6 +300,7 @@ export class PiAgent {
     this.preamble = opts.preamble ?? null;
     this.own = opts.own ?? [];
     this.denylistRe = (opts.denylist ?? []).map((p) => new RegExp(p, "i"));
+    this.preResumeGate = opts.preResumeGate;
     // Wire violation callback from options (used when PiAgent is constructed
     // directly, e.g. in tests; the normal path is server.ts setting onViolation
     // post-construction to combine with its own channel-wiring logic).
@@ -479,6 +487,8 @@ export class PiAgent {
     if (!this.sessionId) {
       throw new PiAgentError(`agent ${this.agentId} has no sessionId — cannot resume`);
     }
+    // Refuse before touching any state — the agent stays cleanly idle/resumable.
+    this.preResumeGate?.();
     if (this.suspendTask) {
       try { await this.suspendTask; } catch { console.warn(`deleg8: suspendTask rejected for ${this.agentId} during resume`); }
       this.suspendTask = null;
@@ -805,7 +815,6 @@ export class PiAgent {
       auto_suspend: this.autoSuspend,
       denied_count: this.deniedCommands.length,
       scope_violations: this.scopeViolations.length,
-      preamble: this.preamble,
     };
   }
   

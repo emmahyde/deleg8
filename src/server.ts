@@ -24,6 +24,18 @@ export interface PiAgentServerOptions {
   binary?: string;
   /** Override the log directory. Ignored if `registry` is set. */
   logDir?: string;
+  /** Max concurrent agent subprocesses (0 = uncapped). Ignored if `registry` is set. */
+  maxAgents?: number;
+  /** Refuse spawns below this free-memory %. (0 = disabled). Ignored if `registry` is set. */
+  minFreeMemPct?: number;
+}
+
+/** Non-negative integer from the environment, or undefined when unset/invalid. */
+function envNonNegInt(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw === "") return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
 export interface PiAgentServerHandle {
@@ -57,6 +69,8 @@ export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentSer
       binary: opts.binary ?? process.env.OMP_BIN ?? "omp",
       onUIRequest: makeElicitBridge(server),
       logDir: opts.logDir ?? defaultLogDir,
+      maxAgents: opts.maxAgents ?? envNonNegInt("DELEG8_MAX_AGENTS"),
+      minFreeMemPct: opts.minFreeMemPct ?? envNonNegInt("DELEG8_MIN_FREE_MEM_PCT"),
     });
   registerTools(server, registry);
   return { server, registry };
@@ -74,6 +88,22 @@ interface TaskEntry {
   updated_at: number;
 }
 
+/** Maximum tasks per agent before task_create is rejected. */
+const MAX_TASKS_PER_AGENT = 100;
+/** Maximum label length for a task. */
+const MAX_TASK_LABEL_BYTES = 200;
+/** Maximum note length for a task. */
+const MAX_TASK_NOTE_BYTES = 1000;
+
+/**
+ * Remove all tasks belonging to the given agent_id from the task map.
+ * Called when an agent finishes (agent_end), is stopped, or pruned.
+ */
+function cleanupAgentTasks(taskMap: Map<string, TaskEntry>, agentId: string): void {
+  for (const [id, entry] of taskMap) {
+    if (entry.agent_id === agentId) taskMap.delete(id);
+  }
+}
 function registerTools(server: McpServer, registry: AgentRegistry): void {
   const taskMap = new Map<string, TaskEntry>();
   let taskSeq = 0;
@@ -154,12 +184,8 @@ async function project(value: unknown, jq: string | undefined): Promise<unknown>
   };
 }
 function ok(value: unknown, text?: string) {
-  const json = text ?? JSON.stringify(value, null, 2);
-  const isObject = value !== null && typeof value === "object" && !Array.isArray(value);
-  return {
-    content: [{ type: "text" as const, text: json }],
-    structuredContent: isObject ? (value as Record<string, unknown>) : { result: value },
-  };
+  const json = text ?? JSON.stringify(value);
+  return { content: [{ type: "text" as const, text: json }] };
 }
 
 function fail(message: string) {
@@ -188,14 +214,17 @@ server.registerTool(
       "Launch a new `omp --mode rpc` subprocess and register it under `agent_id`. " +
       "Mirrors the native Agent tool: optionally send `initial_prompt` and wait for the response. " +
       "Set `background: true` to return the agent_id immediately and stream output via output later.\n\n" +
-      "New in this version:\n" +
-      "- `denylist`: regex patterns over tool commands. Agents receive these as hard prompt " +
-      "constraints; violations fire channel notifications in real time.\n" +
+      "New enforcement parameters:\n" +
+      "- `denylist`: regex patterns over tool commands. Prompt-level constraints + " +
+      "violation monitoring. omp runs tools internally — deleg8 cannot intercept before execution.\n" +
       "- `own`: glob patterns limiting write scope. Same injection + monitoring pattern.\n" +
       "- `preamble`: shared context block every spawned agent receives before its prompt.\n" +
       "- `fallback_model`: if the primary model fails to apply, try this one.\n" +
-      "- `exclusive`: declare command patterns exclusive across agents (serialized execution).\n" +
-      "- `idle_ttl` / `dead_ttl`: auto-reap agents after inactivity.",
+      "- `exclusive`: cooperative agent protocol — agents acquire/release locks via host tools.\n" +
+      "- `idle_ttl` / `dead_ttl`: auto-reap agents after inactivity (default 1h each).\n\n" +
+      "Capacity: spawn (and resume of an idle agent) is rejected when the concurrent-agent cap " +
+      "(DELEG8_MAX_AGENTS, default 6) is reached or system free memory is below the floor " +
+      "(DELEG8_MIN_FREE_MEM_PCT, default 15%). On rejection, wait for agents to finish or stop one.",
     inputSchema: {
       agent_id: z
         .string()
@@ -244,15 +273,25 @@ server.registerTool(
         .optional()
         .describe(
           "Regex patterns over toolName + command string (e.g. `[\"git (stash|checkout|reset|clean)\", " +
-            "\"dotnet (build|test|publish)\"]`). Agents receive these as prompt constraints " +
-            "and violations fire real-time channel notifications.",
+            "\"dotnet (build|test|publish)\"]`). Agents receive these as prompt-level constraints " +
+            "(injected into initial_prompt before the task instructions); matching tool_execution_start " +
+            "frames fire real-time channel notifications.\n\n" +
+            "Architectural note: omp runs its Bash/Read/Edit tools internally. deleg8 receives " +
+            "tool_execution_start frames AFTER execution begins — it cannot intercept before the tool " +
+            "runs. Enforcement combines (a) prompt-level agent instruction (primary) with (b) real-time " +
+            "violation monitoring (visibility into bypass). This is the best available given omp's " +
+            "internal tool execution model.",
         ),
       own: z
         .array(z.string())
         .optional()
         .describe(
-          "Glob patterns constaining write scope (e.g. `[\"src/**\", \"docs/*\"]`). " +
-            "Agents get prompt-level blocking instructions; violations fire channel events.",
+          "Glob patterns constraining write scope (e.g. `[\"src/**\", \"docs/*\"]`). " +
+            "Agents receive prompt-level blocking instructions; writes outside scope " +
+            "fire channel notifications.\n\n" +
+            "Same architectural constraint as denylist: omp runs tool execution internally, " +
+            "so the primary enforcement is the agent's prompt instruction. Violation monitoring " +
+            "provides real-time visibility into any bypass.",
         ),
       preamble: z
         .string()
@@ -266,13 +305,13 @@ server.registerTool(
         .int()
         .nonnegative()
         .optional()
-        .describe("Auto-reap idle agents after N ms of inactivity (registry-level, 0 = off)."),
+        .describe("Auto-reap idle agents after N ms of inactivity (registry-level, default 1h, 0 = off)."),
       dead_ttl: z
         .number()
         .int()
         .nonnegative()
         .optional()
-        .describe("Auto-reap dead agents after N ms (registry-level, 0 = off)."),
+        .describe("Auto-reap dead agents after N ms (registry-level, default 1h, 0 = off)."),
       exclusive: z
         .array(
           z.object({
@@ -284,8 +323,13 @@ server.registerTool(
         .describe(
           "Declare command patterns as exclusive across agents. Agents acquire/release locks " +
             "via host_tool_call tools `exclusive_acquire`/`exclusive_release`. Only one agent " +
-            "holds each lock at a time.",
-        ),
+            "holds each lock at a time; queued waiters acquire on release.\n\n" +
+            "This is a cooperative agent protocol: agents must call `exclusive_acquire` before " +
+            "running the command and `exclusive_release` after. A rogue agent ignoring the " +
+            "protocol can bypass the lock (omp runs tools internally — deleg8 cannot intercept). " +
+            "Lock state is tracked in the registry and released on agent stop/remove/prune.\n" +
+            "The `send` MCP tool also performs a best-effort check against the prompt text.",
+      ),
     },
     annotations: {
       title: "Spawn pi subagent",
@@ -298,10 +342,10 @@ server.registerTool(
   async (args) =>
     guard(async () => {
       // ── Set registry-level TTL ──────────────────────────────────────
-      const idleTTL = args.idle_ttl ?? 0;
-      const deadTTL = args.dead_ttl ?? 0;
-      if (idleTTL > 0 || deadTTL > 0) {
-        registry.setTTL(idleTTL, deadTTL);
+      // Only explicit args override the registry default (1h); an explicit 0
+      // disables that reap.
+      if (args.idle_ttl !== undefined || args.dead_ttl !== undefined) {
+        registry.setTTL(args.idle_ttl, args.dead_ttl);
       }
       if (args.exclusive !== undefined && args.exclusive.length > 0) {
         registry.setExclusive(args.exclusive);
@@ -368,6 +412,8 @@ server.registerTool(
           },
         }).catch((err) => console.error("[deleg8] channel agent_end notification failed:", err));
       };
+      // Clean up tasks for finished agents
+      cleanupAgentTasks(taskMap, agent.agentId);
 
       // Wire host_tool_call handling: msg, task_create/update/list, exclusive_acquire/release.
       agent.onHostRequest = async (agentId, request) => {
@@ -376,24 +422,20 @@ server.registerTool(
         const args = (req.args ?? {}) as Record<string, unknown>;
         const id = typeof req.id === "string" ? req.id : "";
 
-        if (tool === "msg") {
-          const text = String(args.text ?? "").slice(0, 2000);
-          server.server.notification({
-            method: "notifications/claude/channel",
-            params: { content: text, meta: { agent_id: agentId, event: "msg" } },
-          }).catch((err) => console.error("[deleg8] channel msg notification failed:", err));
-          return { id, type: "host_tool_result", result: { ok: true } } as unknown as Frame;
-        }
-
         if (tool === "task_create") {
+          // Enforce per-agent task cap
+          const agentTaskCount = [...taskMap.values()].filter((t) => t.agent_id === agentId).length;
+          if (agentTaskCount >= MAX_TASKS_PER_AGENT) {
+            return { id, type: "host_tool_result", isError: true, result: { error: `task limit reached (${MAX_TASKS_PER_AGENT} per agent)` } } as unknown as Frame;
+          }
           taskSeq += 1;
           const taskId = `task-${taskSeq}`;
           const entry: TaskEntry = {
             id: taskId,
             agent_id: agentId,
-            label: String(args.label ?? "unnamed"),
+            label: String(args.label ?? "unnamed").slice(0, MAX_TASK_LABEL_BYTES),
             status: "pending",
-            note: args.note !== undefined ? String(args.note) : undefined,
+            note: args.note !== undefined ? String(args.note).slice(0, MAX_TASK_NOTE_BYTES) : undefined,
             created_at: Date.now(),
             updated_at: Date.now(),
           };
@@ -408,7 +450,6 @@ server.registerTool(
           }).catch((err) => console.error("[deleg8] channel task_create notification failed:", err));
           return { id, type: "host_tool_result", result: entry } as unknown as Frame;
         }
-
         if (tool === "task_update") {
           const taskId = String(args.task_id ?? "");
           const entry = taskMap.get(taskId);
@@ -532,6 +573,26 @@ server.registerTool(
   async (args) =>
     guard(async () => {
       const agent = registry.get(args.agent_id);
+
+      // Best-effort exclusive lock check: if the message text matches an exclusive
+      // pattern and the target agent doesn't hold the lock, warn via channel event.
+      for (const entry of registry.exclusive) {
+        const re = new RegExp(entry.pattern, "i");
+        if (re.test(args.message)) {
+          const holder = registry.exclusiveLocks.get(entry.pattern);
+          if (holder && holder !== args.agent_id) {
+            server.server.notification({
+              method: "notifications/claude/channel",
+              params: {
+                content: `[deleg8 SEND] ${args.agent_id} sent a message matching exclusive pattern /${entry.pattern}/i but lock is held by ${holder}`,
+                meta: { agent_id: args.agent_id, event: "exclusive_contention", pattern: entry.pattern, holder },
+              },
+            }).catch((err: Error) => console.error("[deleg8] exclusive contention notification failed:", err));
+          }
+          break; // only warn on first match
+        }
+      }
+
       if (args.background) {
         await agent.sendPrompt(args.message, { wait: false });
         const result: Record<string, unknown> = {
@@ -835,31 +896,36 @@ server.registerTool(
       },
     },
     async (args) =>
-      guard(async () => {
-        taskSeq += 1;
-        const taskId = `task-${taskSeq}`;
-        const entry: TaskEntry = {
-          id: taskId,
-          agent_id: args.agent_id,
-          label: args.label,
-          status: "pending",
-          note: args.note,
-          created_at: Date.now(),
-          updated_at: Date.now(),
-        };
-        taskMap.set(taskId, entry);
+    guard(async () => {
+      // Enforce per-agent task cap
+      const agentTaskCount = [...taskMap.values()].filter((t) => t.agent_id === args.agent_id).length;
+      if (agentTaskCount >= MAX_TASKS_PER_AGENT) {
+        return fail(`task limit reached (${MAX_TASKS_PER_AGENT} per agent)`);
+      }
+      taskSeq += 1;
+      const taskId = `task-${taskSeq}`;
+      const entry: TaskEntry = {
+        id: taskId,
+        agent_id: args.agent_id,
+        label: String(args.label).slice(0, MAX_TASK_LABEL_BYTES),
+        status: "pending",
+        note: args.note ? String(args.note).slice(0, MAX_TASK_NOTE_BYTES) : undefined,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      };
+      taskMap.set(taskId, entry);
 
-        // Fire notification so Claude Code UI updates/logs it
-        server.server.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: `[${taskId}] created [pending] ${entry.label}${entry.note ? ` — ${entry.note}` : ""}`,
-            meta: { agent_id: args.agent_id, event: "task_create", task_id: taskId, task: entry },
-          },
-        }).catch((err) => console.error("[deleg8] host task_create notification failed:", err));
+      // Fire notification so Claude Code UI updates/logs it
+      server.server.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `[${taskId}] created [pending] ${entry.label}${entry.note ? ` — ${entry.note}` : ""}`,
+          meta: { agent_id: args.agent_id, event: "task_create", task_id: taskId, task: entry },
+        },
+      }).catch((err) => console.error("[deleg8] host task_create notification failed:", err));
 
-        return ok(entry);
-      }),
+      return ok(entry);
+    }),
   );
 
   // ── task_update ──────────────────────────────────────────────────────────

@@ -6,6 +6,28 @@ import type { Frame } from "./frames.ts";
 const ID_RE = /^[a-zA-Z0-9_.\-]{1,64}$/;
 let AUTO_ID = 0;
 
+// Each omp subprocess is a full LLM CLI (hundreds of MB to GB resident). An
+// uncapped fan-out exhausted RAM + swap and kernel-panicked a 16GB machine on
+// 2026-07-25 (~15 concurrent agents). These defaults are the safety net.
+const DEFAULT_MAX_AGENTS = 6;
+const DEFAULT_MIN_FREE_MEM_PCT = 15;
+const DEFAULT_TTL_MS = 3_600_000; // 1h — idle/dead entries reaped by default
+
+/**
+ * System-wide free-memory percentage, or null when unknowable (non-macOS,
+ * command missing, output changed). Callers must fail open on null.
+ */
+function readFreeMemPctDefault(): number | null {
+  try {
+    const res = Bun.spawnSync(["memory_pressure", "-Q"], { stderr: "ignore" });
+    if (!res.success) return null;
+    const m = res.stdout.toString().match(/free percentage:\s*(\d+)%/);
+    return m ? Number(m[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
 export interface RegistryOptions {
   binary?: string;
   /** Default UI-request handler injected into every spawned agent. */
@@ -14,13 +36,31 @@ export interface RegistryOptions {
   logDir?: string;
   /**
    * Auto-reap idle agents after N ms of inactivity after their last agent_end.
-   * 0 (default) = no auto-reap.
+   * Default 1h; 0 = no auto-reap.
    */
   idleTTL?: number;
   /**
-   * Auto-reap dead agents after N ms. 0 (default) = no auto-reap.
+   * Auto-reap dead agents after N ms. Default 1h; 0 = no auto-reap.
    */
   deadTTL?: number;
+  /**
+   * Maximum agents with a live subprocess (running + mid-start). Spawn and
+   * resume are rejected past the cap. Default 6; 0 = uncapped.
+   */
+  maxAgents?: number;
+  /**
+   * Refuse to start a subprocess when system free memory is below this
+   * percentage. Default 15; 0 = disabled. Unknowable free memory (non-macOS)
+   * fails open.
+   */
+  minFreeMemPct?: number;
+  /** Test hook: replaces the `memory_pressure -Q` reader. */
+  readFreeMemPct?: () => number | null;
+  /**
+   * Test hook: full argv passed to every spawned PiAgent as its `command`
+   * override, replacing binary+rpcMode (e.g. ["bun", "run", mockPath]).
+   */
+  spawnCommand?: string[];
   /**
    * Called when an agent is auto-reaped (idle/dead TTL expiry).
    */
@@ -49,6 +89,12 @@ export class AgentRegistry {
   private readonly logDir: string | undefined;
   private idleTTL: number;
   private deadTTL: number;
+  private readonly maxAgents: number;
+  private readonly minFreeMemPct: number;
+  private readonly readFreeMemPct: () => number | null;
+  private readonly spawnCommand: string[] | undefined;
+  /** Spawns past assertCapacity but not yet registered — counted against the cap. */
+  private inFlightStarts = 0;
   private readonly onReap: ((agentId: string, state: "idle" | "dead") => void) | undefined;
   readonly exclusive: ReadonlyArray<{ pattern: string; wait: boolean }>;
 
@@ -66,8 +112,12 @@ export class AgentRegistry {
     this.binary = opts.binary ?? "omp";
     this.onUIRequest = opts.onUIRequest;
     this.logDir = opts.logDir;
-    this.idleTTL = opts.idleTTL ?? 0;
-    this.deadTTL = opts.deadTTL ?? 0;
+    this.idleTTL = opts.idleTTL ?? DEFAULT_TTL_MS;
+    this.deadTTL = opts.deadTTL ?? DEFAULT_TTL_MS;
+    this.maxAgents = opts.maxAgents ?? DEFAULT_MAX_AGENTS;
+    this.minFreeMemPct = opts.minFreeMemPct ?? DEFAULT_MIN_FREE_MEM_PCT;
+    this.readFreeMemPct = opts.readFreeMemPct ?? readFreeMemPctDefault;
+    this.spawnCommand = opts.spawnCommand;
     this.onReap = opts.onReap;
     this.exclusive = opts.exclusive ?? [];
     this.exclusiveRe = opts.exclusive?.map((e) => ({
@@ -80,12 +130,49 @@ export class AgentRegistry {
     }
   }
 
-  /** Update idle/dead TTL at runtime (e.g. from spawn config). */
-  setTTL(idleTTL: number, deadTTL: number): void {
-    this.idleTTL = idleTTL;
-    this.deadTTL = deadTTL;
-    if ((idleTTL > 0 || deadTTL > 0) && !this.reapInterval) {
+  /**
+   * Update idle/dead TTL at runtime (e.g. from spawn config). An undefined
+   * value keeps the current setting; an explicit 0 disables that reap.
+   */
+  setTTL(idleTTL?: number, deadTTL?: number): void {
+    this.idleTTL = idleTTL ?? this.idleTTL;
+    this.deadTTL = deadTTL ?? this.deadTTL;
+    if ((this.idleTTL > 0 || this.deadTTL > 0) && !this.reapInterval) {
       this.startReap();
+    }
+  }
+
+  /** Current TTL settings (ms). */
+  get ttls(): { idle: number; dead: number } {
+    return { idle: this.idleTTL, dead: this.deadTTL };
+  }
+
+  /** Agents whose subprocess is live (state "running"). */
+  runningCount(): number {
+    return this.list().filter((a) => a.status().state === "running").length;
+  }
+
+  /**
+   * Throw unless another subprocess may start. Guards both spawn and resume —
+   * the two paths that create an omp process. `action` names the caller for
+   * the error message.
+   */
+  assertCapacity(action: string): void {
+    const live = this.runningCount() + this.inFlightStarts;
+    if (this.maxAgents > 0 && live >= this.maxAgents) {
+      throw new PiAgentError(
+        `${action} rejected: ${live} agents already running or starting (max ${this.maxAgents}). ` +
+          `Wait for one to finish, stop one, or raise DELEG8_MAX_AGENTS.`,
+      );
+    }
+    if (this.minFreeMemPct > 0) {
+      const pct = this.readFreeMemPct();
+      if (pct !== null && pct < this.minFreeMemPct) {
+        throw new PiAgentError(
+          `${action} rejected: system free memory ${pct}% is below the ${this.minFreeMemPct}% floor. ` +
+            `Stop agents or free memory, or lower DELEG8_MIN_FREE_MEM_PCT (0 disables).`,
+        );
+      }
     }
   }
 
@@ -185,16 +272,25 @@ export class AgentRegistry {
       }
       this.agents.delete(aid);
     }
+    this.assertCapacity(`spawn ${aid}`);
     const agent = new PiAgent(aid, {
       binary: this.binary,
+      command: this.spawnCommand,
       extraArgs: opts.extraArgs,
       cwd: opts.cwd,
       rpcMode: opts.rpcMode,
       onUIRequest: this.onUIRequest,
       logDir: this.logDir,
+      // Resume respawns the subprocess, so it counts against the same cap.
+      preResumeGate: () => this.assertCapacity(`resume ${aid}`),
     });
-    await agent.start();
-    this.agents.set(aid, agent);
+    this.inFlightStarts += 1;
+    try {
+      await agent.start();
+      this.agents.set(aid, agent);
+    } finally {
+      this.inFlightStarts -= 1;
+    }
     return agent;
   }
 
