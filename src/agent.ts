@@ -9,7 +9,7 @@
 // Response frames whose `id` matches a pending request complete that request's
 // promise; every frame is also pushed to a bounded ring buffer for `pi_output`.
 
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, mkdirSync, existsSync, statSync, renameSync } from "node:fs";
 import { join } from "node:path";
 
 import { encode, readLines, decode, type Frame } from "./frames.ts";
@@ -40,6 +40,12 @@ export interface AgentStatus {
   session_file: string | null;
   session_dir: string | null;
   auto_suspend: boolean;
+  /** Number of commands blocked by denylist (this session). */
+  denied_count: number;
+  /** Number of file writes outside declared scope. */
+  scope_violations: number;
+  /** Shared context preamble (if set). */
+  preamble: string | null;
 }
 
 export interface BufferedFrame {
@@ -55,6 +61,79 @@ interface Pending {
 
 const BUFFER_CAP = 1024;
 let ID_COUNTER = 0;
+
+// omp frames (esp. "response") embed the full accumulated conversation on
+// every turn, so logging them verbatim makes the .log file grow ~quadratically
+// with conversation length (observed: multi-GB files after long sessions).
+// Cap what we write per line and cap+rotate the file itself so logs stay
+// bounded regardless of session length. This only affects the NDJSON debug
+// .log — the .jsonl session transcript written by omp itself is untouched.
+const MAX_LOG_LINE_BYTES = 4 * 1024;
+const MAX_LOG_FILE_BYTES = 50 * 1024 * 1024;
+
+/** Reduce a frame to a bounded-size line for the debug .log, summarizing rather
+ * than truncating mid-JSON when the full frame would exceed the per-line cap. */
+function summarizeFrameForLog(frame: Frame): string {
+  const full = JSON.stringify(frame);
+  if (full.length <= MAX_LOG_LINE_BYTES) return full;
+  const summary: Record<string, unknown> = { id: frame.id, type: frame.type };
+  if (typeof frame.toolName === "string") summary.toolName = frame.toolName;
+  if (typeof frame.model === "string") summary.model = frame.model;
+  summary.truncated = true;
+  summary.originalBytes = full.length;
+  summary.preview = full.slice(0, MAX_LOG_LINE_BYTES);
+  return JSON.stringify(summary);
+}
+
+/** Rotate log via cached size check. Only calls statSync once (first write).
+ * Subsequent writes use the in-memory accumulator; on rotation the counter is
+ * reset and the one-time stat repeats lazily. */
+function rotateLogIfNeeded(logPath: string, incomingBytes: number, cachedSize: { value: number; init: boolean }): number | null {
+  if (!cachedSize.init) {
+    // First write — stat the file to initialize
+    try {
+      if (existsSync(logPath)) cachedSize.value = statSync(logPath).size;
+    } catch { /* best-effort */ }
+    cachedSize.init = true;
+  }
+  if (cachedSize.value + incomingBytes > MAX_LOG_FILE_BYTES) {
+    try {
+      renameSync(logPath, `${logPath}.1`);
+    } catch { /* best-effort; if rotation fails we just keep appending */ }
+    cachedSize.value = incomingBytes;
+    // File rotated — next write will re-stat to confirm
+    cachedSize.init = false;
+    return cachedSize.value;
+  }
+  cachedSize.value += incomingBytes;
+  return cachedSize.value;
+}
+
+// Real sessions produce 14k-24k frames but the ring buffer above only keeps
+// the last BUFFER_CAP — early tool calls are long gone by the time a digest
+// is requested. modifiedFiles (below) tracks paths durably, independent of
+// the buffer, from the same frame-intake path. omp emits lowercase
+// `tool_execution_start` frames with a `toolName` + `args` object; "write"
+// carries a clean args.path, "edit" has no path field — the path lives in a
+// patch-header line embedded in args.input (e.g. `[docs/STATE.md#1D48]`,
+// possibly several per patch) — strip the `#...` suffix and pull every header.
+const FILE_MODIFYING_TOOL_NAMES = new Set(["write", "edit", "multiedit"]);
+const PATCH_HEADER_RE = /^\[([^\]#]+)/gm;
+
+function extractToolCallPaths(args: Record<string, unknown> | undefined): string[] {
+  if (!args) return [];
+  const path = args.path ?? args.file_path;
+  if (typeof path === "string" && path.length > 0) return [path];
+  if (typeof args.input === "string") {
+    const paths: string[] = [];
+    for (const m of args.input.matchAll(PATCH_HEADER_RE)) {
+      const p = m[1]?.trim();
+      if (p) paths.push(p);
+    }
+    return paths;
+  }
+  return [];
+}
 
 export interface PiAgentOptions {
   binary?: string;
@@ -80,6 +159,36 @@ export interface PiAgentOptions {
   sessionDir?: string;
   /** If true, suspend the subprocess after every `turn_end` (default true). */
   autoSuspend?: boolean;
+  /**
+   * Regex patterns over argv for denied commands. When a tool_execution_start frame
+   * matches, the tool is NOT blocked at the OS level (omp runs it internally), but a
+   * violation is recorded and a callback fires. Paired with prompt injection at the
+   * spawn site for agent-level enforcement.
+   *
+   * Each string is a case-insensitive regex tested against the concatenated
+   * `toolName + " " + command` (or just `toolName` if no command arg).
+   */
+  denylist?: string[];
+  /**
+   * Glob patterns constraining which files this agent may write. When a
+   * tool_execution_start frame for write/edit/multiedit targets a path outside
+   * all `own` patterns, a scope violation is recorded and a callback fires.
+   * Paired with prompt injection at the spawn site.
+   */
+  own?: string[];
+  /**
+   * Shared context block prepended to every initial_prompt. Designed for
+   * fan-out-level ground-truth that every spawned agent receives — library
+   * idioms, API contracts, forbidden patterns — without repeating it per prompt.
+   */
+  preamble?: string;
+  /** Fallback model if the primary set_model fails (e.g. budget exceeded). */
+  fallbackModel?: { provider: string; modelId: string };
+  /**
+   * Called when a tool_execution_start frame violates a denylist pattern or
+   * write-scope constraint. The deleg8 server wires this to channel notifications.
+   */
+  onViolation?: (agentId: string, type: "denied" | "scope", detail: Record<string, unknown>) => void;
 }
 
 export class PiAgent {
@@ -90,7 +199,7 @@ export class PiAgent {
   private readonly env: Record<string, string> | undefined;
   private readonly rpcMode: "rpc" | "rpc-ui";
   private readonly onUIRequest: ((req: Frame) => Promise<Frame | null>) | undefined;
-  private readonly onHostRequest: ((req: Frame) => Promise<Frame | null>) | undefined;
+  private readonly _optOnHostRequest: ((req: Frame) => Promise<Frame | null>) | undefined;
   private readonly command: string[] | undefined;
   private readonly logDir: string | null;
   private logPath: string | null = null;
@@ -108,12 +217,63 @@ export class PiAgent {
   private suspendTask: Promise<void> | null = null;
   private readonly pending = new Map<string, Pending>();
   private readonly buffer: BufferedFrame[] = [];
+  /** Files touched by write/edit tool calls, survives ring-buffer eviction. */
+  readonly modifiedFiles: Set<string> = new Set();
   private bufferSeq = 0;
   private startedAt = 0;
   private lastActivity = 0;
   private messageCount = 0;
   private model: string | null = null;
+  /** Running total of message.usage.cost.total across all frames, O(1) query cost. */
+  private totalCostUsd: number = 0;
+  /** Cached log file size to avoid statSync on every frame. Reset on rotation. */
+  private logSize: number = 0;
+  private logSizeInitialized: boolean = false;
   private writeChain: Promise<void> = Promise.resolve();
+  /** Denylist regex patterns compiled at construction. Server can append. */
+  denylistRe: RegExp[] = [];
+  /** Write-scope glob patterns compiled at construction (minimatch not used — host-side server does minimatch). */
+  /** Write-scope glob patterns. Server can extend post-construction. */
+  own: string[] = [];
+  /** Shared context injected before every prompt. */
+  preamble: string | null = null;
+  /** Commands that matched a denylist entry, in chronological order. */
+  readonly deniedCommands: Array<{
+    seq: number;
+    toolName: string;
+    command: string;
+    pattern: string;
+    ts: number;
+  }> = [];
+  /** File writes that fell outside `own` scope, in chronological order. */
+  readonly scopeViolations: Array<{
+    seq: number;
+    toolName: string;
+    path: string;
+    ts: number;
+  }> = [];
+  /** Fallback model spec for when the primary model fails to apply. */
+  fallbackModel: { provider: string; modelId: string } | null = null;
+
+  /**
+   * Called for every turn_end and agent_end frame — used by channel push.
+   * Must be set by every code path that creates a PiAgent (currently only the spawn handler).
+   * Prefer threading this through RegistryOptions (like onUIRequest) once a second creation path exists.
+   */
+  onChannelFrame?: (agentId: string, frame: Frame, ftype: "turn_end" | "agent_end") => void;
+
+  /**
+   * Called for every host_tool_call / host_uri_request. Return the response frame to write back,
+   * or null to fall through to the default error response. Set by the spawn handler to enable
+   * IRC-style messaging and task tracking without needing opts at construction time.
+   */
+  onHostRequest?: (agentId: string, request: Frame) => Promise<Frame | null>;
+
+  /**
+   * Called when a tool_execution_start frame violates a denylist or scope constraint.
+   * Wired by the server to fire channel notifications for real-time orchestrator visibility.
+   */
+  onViolation?: (agentId: string, type: "denied" | "scope", detail: Record<string, unknown>) => void;
 
   constructor(agentId: string, opts: PiAgentOptions = {}) {
     this.agentId = agentId;
@@ -123,12 +283,20 @@ export class PiAgent {
     this.env = opts.env;
     this.rpcMode = opts.rpcMode ?? "rpc-ui";
     this.onUIRequest = opts.onUIRequest;
-    this.onHostRequest = opts.onHostRequest;
+    this._optOnHostRequest = opts.onHostRequest;
     this.command = opts.command;
     this.logDir = opts.logDir ?? null;
     this.logPath = opts.logPath ?? null;
     this.sessionDir = opts.sessionDir ?? (this.logDir ? join(this.logDir, agentId, "omp") : null);
     this.autoSuspend = opts.autoSuspend ?? true;
+    this.fallbackModel = opts.fallbackModel ?? null;
+    this.preamble = opts.preamble ?? null;
+    this.own = opts.own ?? [];
+    this.denylistRe = (opts.denylist ?? []).map((p) => new RegExp(p, "i"));
+    // Wire violation callback from options (used when PiAgent is constructed
+    // directly, e.g. in tests; the normal path is server.ts setting onViolation
+    // post-construction to combine with its own channel-wiring logic).
+    this.onViolation = opts.onViolation;
   }
 
   // ── lifecycle ─────────────────────────────────────────────────────────
@@ -256,9 +424,7 @@ export class PiAgent {
       if (!force) {
         try {
           await this.sendRaw({ type: "abort" }, { wait: false });
-        } catch {
-          /* ignore */
-        }
+        } catch { console.debug(`deleg8: abort send failed for ${this.agentId} (process may have already exited)`); }
       }
       proc.kill(force ? "SIGKILL" : "SIGTERM");
       const exited = proc.exited;
@@ -273,11 +439,8 @@ export class PiAgent {
     if (this.readerTask) {
       try {
         await this.readerTask;
-      } catch {
-        /* ignore */
-      }
+      } catch { console.debug(`deleg8: readerTask rejected for ${this.agentId} during stop (expected during shutdown)`); }
     }
-    for (const [, p] of this.pending) p.reject(new PiAgentError("agent stopped"));
     this.pending.clear();
     return proc.exitCode;
   }
@@ -307,23 +470,18 @@ export class PiAgent {
       await proc.exited;
     }
     if (this.readerTask) {
-      try { await this.readerTask; } catch { /* ignore */ }
+      try { await this.readerTask; } catch { console.debug(`deleg8: readerTask rejected for ${this.agentId} during suspend (expected)`); }
     }
-    for (const [, p] of this.pending) p.reject(new PiAgentError("agent suspended mid-request"));
-    this.pending.clear();
-    this.proc = null;
-    this.readerTask = null;
   }
 
   /** Respawn an idle agent against its prior session. No-op if already running. */
   async resume(): Promise<void> {
-    if (this.suspendTask) {
-      try { await this.suspendTask; } catch { /* ignore */ }
-      this.suspendTask = null;
-    }
-    if (this.state === "running") return;
     if (!this.sessionId) {
-      throw new PiAgentError(`agent ${this.agentId} has no sessionId to resume from`);
+      throw new PiAgentError(`agent ${this.agentId} has no sessionId — cannot resume`);
+    }
+    if (this.suspendTask) {
+      try { await this.suspendTask; } catch { console.warn(`deleg8: suspendTask rejected for ${this.agentId} during resume`); }
+      this.suspendTask = null;
     }
     this.proc = null;
     await this.start();
@@ -421,9 +579,63 @@ export class PiAgent {
     this.bufferSeq += 1;
     this.buffer.push({ seq: this.bufferSeq, ts: this.lastActivity, frame });
     if (this.buffer.length > BUFFER_CAP) this.buffer.shift();
+    if (frame.type === "tool_execution_start") {
+      const toolName = typeof frame.toolName === "string" ? frame.toolName.toLowerCase() : "";
+      const args = frame.args as Record<string, unknown> | undefined;
+      if (FILE_MODIFYING_TOOL_NAMES.has(toolName)) {
+        for (const p of extractToolCallPaths(args)) this.modifiedFiles.add(p);
+      }
+
+      // ── Denylist check ──────────────────────────────────────────────
+      if (this.denylistRe.length > 0) {
+        const command = typeof args?.command === "string" ? args.command : "";
+        const probe = command ? `${toolName} ${command}` : toolName;
+        for (const re of this.denylistRe) {
+          if (re.test(probe)) {
+            const entry = { seq: this.bufferSeq, toolName, command, pattern: re.source, ts: this.lastActivity };
+            this.deniedCommands.push(entry);
+            this.onViolation?.(this.agentId, "denied", { ...entry });
+            break;
+          }
+        }
+      }
+
+      // ── Write-scope check ───────────────────────────────────────────
+      if (this.own.length > 0 && FILE_MODIFYING_TOOL_NAMES.has(toolName)) {
+        const paths = extractToolCallPaths(args);
+        for (const p of paths) {
+          const inScope = this.own.some((pattern) => {
+            // Simple glob-to-regex conversion: * matches anything except /
+            // ** matches everything; anchored at both ends.
+            const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "___DOUBLESTAR___").replace(/\*/g, "[^/]*").replace(/___DOUBLESTAR___/g, ".*");
+            return new RegExp(`^${escaped}$`).test(p);
+          });
+          if (!inScope) {
+            const entry = { seq: this.bufferSeq, toolName, path: p, ts: this.lastActivity };
+            this.scopeViolations.push(entry);
+            this.onViolation?.(this.agentId, "scope", { ...entry });
+          }
+        }
+      }
+    }
+    // Accumulate running cost from assistant message_end frames — O(1) per frame
+    // instead of scanning the full buffer on every list/status call.
+    if (frame.type === "message_end") {
+      const message = (frame as Record<string, unknown>).message as Record<string, unknown> | undefined;
+      if (message?.role === "assistant") {
+        const usage = message.usage as Record<string, unknown> | undefined;
+        const cost = (usage?.cost as Record<string, unknown> | undefined)?.total;
+        if (typeof cost === "number") this.totalCostUsd += cost;
+      }
+    }
     if (this.logPath) {
       try {
-        appendFileSync(this.logPath, JSON.stringify(frame) + "\n");
+        const line = summarizeFrameForLog(frame) + "\n";
+        const cache = { value: this.logSize, init: this.logSizeInitialized };
+        const newSize = rotateLogIfNeeded(this.logPath, line.length, cache);
+        this.logSize = cache.value;
+        this.logSizeInitialized = cache.init;
+        appendFileSync(this.logPath, line);
       } catch {
         /* logging is best-effort; don't crash the reader on disk errors */
       }
@@ -439,6 +651,10 @@ export class PiAgent {
         this.readyReject = null;
       }
       return;
+    }
+
+    if (ftype === "agent_end" || ftype === "turn_end") {
+      this.onChannelFrame?.(this.agentId, frame, ftype);
     }
 
     if (ftype === "agent_end" && this.autoSuspend && this.state === "running" && this.sessionId && this.sessionDir) {
@@ -492,21 +708,37 @@ export class PiAgent {
         await this.safeWrite({ type: "extension_ui_response", id, cancelled: true });
       }
     } catch {
+      console.error(`deleg8: UI request handler threw for ${this.agentId} — declining`);
       await this.safeWrite({ type: "extension_ui_response", id, cancelled: true });
     }
   }
-
+  
   private async handleHostRequest(request: Frame): Promise<void> {
     const id = typeof request.id === "string" ? request.id : "";
     if (!id) return;
+    // Public per-agent handler (set by server.ts spawn handler for msg/task tools).
     if (this.onHostRequest) {
       try {
-        const response = await this.onHostRequest(request);
+        const response = await this.onHostRequest(this.agentId, request);
         if (response) {
           await this.safeWrite(response);
           return;
         }
       } catch {
+        console.error(`deleg8: onHostRequest first handler threw for ${this.agentId}`);
+        /* fall through */
+      }
+    }
+    // Legacy options-level handler.
+    if (this._optOnHostRequest) {
+      try {
+        const response = await this._optOnHostRequest(request);
+        if (response) {
+          await this.safeWrite(response);
+          return;
+        }
+      } catch {
+        console.error(`deleg8: onHostRequest legacy handler threw for ${this.agentId}`);
         /* fall through to error response */
       }
     }
@@ -540,7 +772,7 @@ export class PiAgent {
     try {
       await this.writeChain;
     } catch {
-      /* surface via response correlation if it matters */
+      console.debug(`deleg8: safeWrite failed for ${this.agentId} (expected if process already exited)`);
     }
   }
 
@@ -571,13 +803,20 @@ export class PiAgent {
       session_file: this.sessionFile,
       session_dir: this.sessionDir,
       auto_suspend: this.autoSuspend,
+      denied_count: this.deniedCommands.length,
+      scope_violations: this.scopeViolations.length,
+      preamble: this.preamble,
     };
   }
-
+  
+  costUsd(): number {
+    return this.totalCostUsd;
+  }
+  
   getLogPath(): string | null {
     return this.logPath;
   }
-
+  
   output(opts: { sinceSeq?: number; maxFrames?: number } = {}): BufferedFrame[] {
     const since = opts.sinceSeq ?? 0;
     const max = opts.maxFrames ?? 200;

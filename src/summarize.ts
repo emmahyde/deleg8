@@ -9,11 +9,19 @@ import type { Frame } from "./frames.ts";
 export interface SummaryEntry {
   seq: number;
   ts: number;
-  kind: "message" | "error" | "ui_request" | "host_request";
+  kind: "message" | "error" | "ui_request" | "host_request" | "tool_call";
   data: Record<string, unknown>;
 }
 
 const ACTIVE_UI_METHODS = new Set(["select", "confirm", "input", "editor"]);
+
+/** Extract concatenated text from an array of content blocks (MCP message format). */
+export function extractTextContent(content: unknown[]): string {
+  return content
+    .filter((b: any) => b?.type === "text" && typeof b.text === "string")
+    .map((b: any) => b.text as string)
+    .join("");
+}
 
 function extractMessage(frame: Frame): Record<string, unknown> | null {
   const msg = frame.message;
@@ -22,10 +30,7 @@ function extractMessage(frame: Frame): Record<string, unknown> | null {
   const role = typeof m.role === "string" ? m.role : "unknown";
   const content = Array.isArray(m.content) ? m.content : [];
 
-  const text = content
-    .filter((b: any) => b?.type === "text" && typeof b.text === "string")
-    .map((b: any) => b.text as string)
-    .join("");
+  const text = extractTextContent(content);
 
   const blocks = content.map((b: any) => {
     if (b?.type === "text") return { type: "text", text: b.text };
@@ -67,9 +72,44 @@ const FILE_MODIFYING_TOOLS = new Set([
 
 const PATH_FIELDS = ["path", "file_path", "filename", "target_file", "target"];
 
+// Real omp NDJSON never emits "tool_use" content blocks (that's the Anthropic
+// Messages format the FILE_MODIFYING_TOOLS/PATH_FIELDS pair above was written
+// against). omp emits lowercase `tool_execution_start` frames with a `toolName`
+// and an `args` object instead. "write" carries a clean args.path; "edit" has
+// no path field at all — the path lives in a patch-header line embedded in
+// args.input, e.g. `[docs/STATE.md#1D48]` (possibly several, one per edited
+// section) — strip the `#...` suffix and pull every header in the string.
+const FILE_MODIFYING_TOOL_NAMES = new Set(["write", "edit", "multiedit"]);
+const PATCH_HEADER_RE = /^\[([^\]#]+)/gm;
+
+function extractPatchHeaderPaths(input: string): string[] {
+  const paths: string[] = [];
+  for (const m of input.matchAll(PATCH_HEADER_RE)) {
+    const p = m[1]?.trim();
+    if (p) paths.push(p);
+  }
+  return paths;
+}
+
+/** Path(s) touched by a lowercase omp tool call's args, or [] if none found. */
+function extractToolCallPaths(args: Record<string, unknown> | undefined): string[] {
+  if (!args) return [];
+  for (const k of PATH_FIELDS) {
+    const v = args[k];
+    if (typeof v === "string" && v.length > 0) return [v];
+  }
+  if (typeof args.input === "string") return extractPatchHeaderPaths(args.input);
+  return [];
+}
+
 function extractModifiedPaths(entries: SummaryEntry[]): string[] {
   const seen = new Set<string>();
   for (const entry of entries) {
+    if (entry.kind === "tool_call") {
+      const path = (entry.data as { path?: unknown }).path;
+      if (typeof path === "string" && path.length > 0) seen.add(path);
+      continue;
+    }
     if (entry.kind !== "message") continue;
     const blocks = Array.isArray(entry.data.blocks) ? (entry.data.blocks as any[]) : [];
     for (const b of blocks) {
@@ -102,8 +142,14 @@ export function digest(buffered: BufferedFrame[], opts: { lastMessages?: number 
   const assistantMessages = entries.filter(
     (e) => e.kind === "message" && (e.data as { role?: string }).role === "assistant",
   );
+  // Tool-heavy turns produce assistant messages with no extracted text (pure
+  // tool_use blocks) — skip them from the recent-messages window so callers
+  // don't have to filter empty entries themselves.
+  const nonEmptyAssistantMessages = assistantMessages.filter(
+    (e) => ((e.data as { text?: string }).text ?? "").trim().length > 0,
+  );
   return {
-    messages: assistantMessages.slice(-lastN),
+    messages: nonEmptyAssistantMessages.slice(-lastN),
     modified_files: extractModifiedPaths(entries),
     total_assistant_messages: assistantMessages.length,
     total_entries: entries.length,
@@ -148,6 +194,20 @@ export function summarize(buffered: BufferedFrame[]): SummaryEntry[] {
       case "host_uri_request":
         out.push({ seq, ts, kind: "host_request", data: { ...(frame as Record<string, unknown>) } });
         break;
+      case "tool_execution_start": {
+        const toolName = typeof frame.toolName === "string" ? frame.toolName.toLowerCase() : "";
+        if (!FILE_MODIFYING_TOOL_NAMES.has(toolName)) break;
+        const args = frame.args as Record<string, unknown> | undefined;
+        const paths = extractToolCallPaths(args);
+        if (paths.length === 0) {
+          out.push({ seq, ts, kind: "tool_call", data: { toolName } });
+        } else {
+          // One entry per path so a multi-section edit (several patch headers
+          // in one args.input) surfaces every file it touched.
+          for (const path of paths) out.push({ seq, ts, kind: "tool_call", data: { toolName, path } });
+        }
+        break;
+      }
       // Dropped: ready, agent_start, agent_end, turn_start, turn_end, message_start,
       // message_update, thinking_delta, and passive extension_ui_request methods
       // (notify/setStatus/setWidget/setTitle/open_url/cancel/set_editor_text).

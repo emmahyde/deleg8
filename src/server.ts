@@ -3,19 +3,18 @@
 // long-lived subagents addressable from Claude Code.
 
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-
-import { PiAgentError } from "./agent.ts";
+import { PiAgentError, type PiAgent } from "./agent.ts";
+import type { Frame } from "./frames.ts";
 import { jqFilter } from "./jq-filter.ts";
 import { AgentRegistry } from "./registry.ts";
 import { FRAME_SCHEMA } from "./schema.ts";
-import { digest, summarize } from "./summarize.ts";
+import { digest, extractTextContent, summarize } from "./summarize.ts";
 import { makeElicitBridge } from "./ui-bridge.ts";
 
 export interface PiAgentServerOptions {
@@ -33,7 +32,21 @@ export interface PiAgentServerHandle {
 }
 
 export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentServerHandle {
-  const server = new McpServer({ name: "deleg8", version: "0.1.0" });
+  const server = new McpServer(
+    { name: "deleg8", version: "0.1.0" },
+    {
+      capabilities: {
+        experimental: { "claude/channel": {} },
+      },
+      instructions: [
+        "Agent completion arrives as <channel source=\"deleg8\" agent_id=\"X\" event=\"agent_end\"> with the agent's final message — intermediate turn frames are suppressed.",
+        "Agents can send mid-task IRC messages: <channel source=\"deleg8\" agent_id=\"X\" event=\"msg\">.",
+        "To send a direct message from inside a prompt, have the agent call host_tool_call with tool=\"msg\" and args={text:\"...\"}.",
+        "Agents track sub-work via host_tool_call: tool=\"task_create\" args={label,note?} and tool=\"task_update\" args={task_id,status,note?} — each emits a <channel event=\"task_create\"> or <channel event=\"task_update\"> notification in real time.",
+        "Use the tasks tool to query the full task registry. Use the send tool to resume an idle agent.",
+      ].join(" "),
+    },
+  );
   // Per-Claude-Code-session log directory. CLAUDE_SESSION_ID is preferred so
   // logs from the same session land together; otherwise a short generated id.
   const sessionId = process.env.CLAUDE_SESSION_ID ?? randomUUID().slice(0, 8);
@@ -49,45 +62,40 @@ export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentSer
   return { server, registry };
 }
 
+// ── task registry ───────────────────────────────────────────────────────────
+
+interface TaskEntry {
+  id: string;
+  agent_id: string;
+  label: string;
+  status: "pending" | "in_progress" | "done" | "failed";
+  note?: string;
+  created_at: number;
+  updated_at: number;
+}
+
 function registerTools(server: McpServer, registry: AgentRegistry): void {
+  const taskMap = new Map<string, TaskEntry>();
+  let taskSeq = 0;
 
 // ── helpers ─────────────────────────────────────────────────────────────
 
-function collectClaudeMd(cwd?: string): string {
-  const paths = [join(homedir(), ".claude", "CLAUDE.md")];
-  if (cwd) {
-    paths.push(join(cwd, "CLAUDE.md"));
-    paths.push(join(cwd, ".claude", "CLAUDE.md"));
-  }
-  const blocks: string[] = [];
-  for (const p of paths) {
-    try {
-      if (existsSync(p)) {
-        const content = readFileSync(p, "utf8").trim();
-        if (content) blocks.push(`<claude-md source="${p}">\n${content}\n</claude-md>`);
-      }
-    } catch { /* skip unreadable */ }
-  }
-  return blocks.length > 0
-    ? blocks.join("\n\n") + "\n\n---\n\n"
-    : "";
-}
 
 function buildMonitorCmd(agentId: string, logPath: string): string {
   // Generates a bash command for Claude Code's Monitor tool. It:
   //   1. tail -f the NDJSON log
-  //   2. waits for an agent_end frame
+  //   2. waits for an agent_end OR error frame
   //   3. extracts the last assistant message_end text from the full log
   //   4. prints a one-line summary and exits
   // Each stdout line becomes a Monitor notification.
   const lp = logPath.replace(/'/g, "'\\''");
-  // tail -f the log; on agent_end, read the file backwards to find the last
-  // assistant message_end, extract text blocks via jq, print, and exit.
+  // tail -f the log; on agent_end/error, read the file backwards to find the
+  // last assistant message_end, extract text blocks via jq, print, and exit.
   // tac + grep -m1 avoids racing with tail's open file handle.
   return [
     `tail -n +1 -f '${lp}'`,
     `| while IFS= read -r line; do`,
-    `  if printf '%s' "$line" | grep -q '"type":"agent_end"'; then`,
+    `  if printf '%s' "$line" | grep -qE '"type":"agent_end"|"type":"error"'; then`,
     `    last_text=$(tail -r '${lp}'`,
     `      | grep -m1 '"role":"assistant".*"type":"message_end"\\|"type":"message_end".*"role":"assistant"'`,
     `      | jq -r '[.message.content[]? | select(.type=="text") | .text] | join("")' 2>/dev/null);`,
@@ -98,8 +106,53 @@ function buildMonitorCmd(agentId: string, logPath: string): string {
   ].join(" ");
 }
 
+// Prepended to initial_prompt when spawn's `role: "leaf"` is set.
+const LEAF_ROLE_PREAMBLE =
+  "You are a leaf worker: do NOT spawn subagents, do NOT delegate work, do not use any " +
+  "agent/task-spawning tools. Do the work yourself and report results in your final message.\n\n";
+
+/** Build a prompt-constraint block from denylist, own, and preamble config. */
+function buildConstraintBlock(denylist: string[] | undefined, own: string[] | undefined, preamble: string | undefined): string {
+  const parts: string[] = [];
+  if (preamble) parts.push(preamble);
+  if (denylist && denylist.length > 0) {
+    parts.push(
+      "## HARD BLOCKED COMMANDS — DO NOT IGNORE\n" +
+      "The following command patterns are DENIED at the tool-execution layer. " +
+      "Before running ANY tool (especially Bash), check the command string against these patterns. " +
+      "If it matches, you MUST NOT execute the command. Return a tool error result explaining it was blocked.\n" +
+      denylist.map((p) => `- Pattern: /${p}/i`).join("\n"),
+    );
+  }
+  if (own && own.length > 0) {
+    const listing = own.map((g) => `  - ${g}`).join("\n");
+    parts.push(
+      "## WRITE SCOPE\n" +
+      "You may only write to files matching these patterns:\n" +
+      listing +
+      "\nFiles outside these patterns are BLOCKED. Check every Bash/write/edit path before executing. " +
+      "If the target is out of scope, return a tool error — do NOT write.",
+    );
+  }
+  return parts.length > 0 ? parts.join("\n\n") + "\n\n" : "";
+}
+
 const MAX_RESULT_BYTES = 32 * 1024;
 
+
+async function project(value: unknown, jq: string | undefined): Promise<unknown> {
+  const filtered = jq ? await jqFilter(value, jq) : value;
+  const size = JSON.stringify(filtered).length;
+  if (size <= MAX_RESULT_BYTES) return filtered;
+  return {
+    truncated: true,
+    bytes: size,
+    cap: MAX_RESULT_BYTES,
+    hint:
+      "Result exceeds the size cap. Pass (or tighten) a `jq` filter to project " +
+      "only the fields you need. See resource `deleg8://schema/frames` for the catalog.",
+  };
+}
 function ok(value: unknown, text?: string) {
   const json = text ?? JSON.stringify(value, null, 2);
   const isObject = value !== null && typeof value === "object" && !Array.isArray(value);
@@ -125,24 +178,6 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
     return fail(`unexpected: ${msg}`);
   }
 }
-
-// Project tool results through an optional jq filter, then enforce a size cap
-// so a too-broad filter (or no filter at all on a huge raw buffer) can't flood
-// the calling agent's context. On overflow, returns an envelope with a hint.
-async function project(value: unknown, jq: string | undefined): Promise<unknown> {
-  const filtered = jq ? await jqFilter(value, jq) : value;
-  const size = JSON.stringify(filtered).length;
-  if (size <= MAX_RESULT_BYTES) return filtered;
-  return {
-    truncated: true,
-    bytes: size,
-    cap: MAX_RESULT_BYTES,
-    hint:
-      "Result exceeds the size cap. Pass (or tighten) a `jq` filter to project " +
-      "only the fields you need. See resource `deleg8://schema/frames` for the catalog.",
-  };
-}
-
 // ── spawn ────────────────────────────────────────────────────────────
 
 server.registerTool(
@@ -152,7 +187,15 @@ server.registerTool(
     description:
       "Launch a new `omp --mode rpc` subprocess and register it under `agent_id`. " +
       "Mirrors the native Agent tool: optionally send `initial_prompt` and wait for the response. " +
-      "Set `background: true` to return the agent_id immediately and stream output via output later.",
+      "Set `background: true` to return the agent_id immediately and stream output via output later.\n\n" +
+      "New in this version:\n" +
+      "- `denylist`: regex patterns over tool commands. Agents receive these as hard prompt " +
+      "constraints; violations fire channel notifications in real time.\n" +
+      "- `own`: glob patterns limiting write scope. Same injection + monitoring pattern.\n" +
+      "- `preamble`: shared context block every spawned agent receives before its prompt.\n" +
+      "- `fallback_model`: if the primary model fails to apply, try this one.\n" +
+      "- `exclusive`: declare command patterns exclusive across agents (serialized execution).\n" +
+      "- `idle_ttl` / `dead_ttl`: auto-reap agents after inactivity.",
     inputSchema: {
       agent_id: z
         .string()
@@ -167,6 +210,13 @@ server.registerTool(
         })
         .optional()
         .describe("Optional `set_model` frame sent before initial_prompt."),
+      fallback_model: z
+        .object({
+          provider: z.string().describe("e.g. 'openai'"),
+          modelId: z.string().describe("e.g. 'gpt-5'"),
+        })
+        .optional()
+        .describe("If the primary model fails (e.g. budget exceeded), try this one."),
       extra_args: z.array(z.string()).optional().describe("Extra CLI args appended to the omp spawn command."),
       cwd: z.string().optional().describe("Working directory for the omp subprocess."),
       rpc_mode: z
@@ -181,6 +231,61 @@ server.registerTool(
         .default(false)
         .describe("If true, return immediately without waiting for initial_prompt's response."),
       timeout_ms: z.number().int().positive().default(300_000).describe("Wait timeout for initial_prompt."),
+      role: z
+        .enum(["leaf"])
+        .optional()
+        .describe(
+          "Set to 'leaf' to prepend a preamble instructing the worker not to spawn sub-agents or " +
+            "delegate — it must do the work itself. Omitting this leaves today's behavior unchanged.",
+        ),
+      // ── Enforcement config ──────────────────────────────────────────
+      denylist: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Regex patterns over toolName + command string (e.g. `[\"git (stash|checkout|reset|clean)\", " +
+            "\"dotnet (build|test|publish)\"]`). Agents receive these as prompt constraints " +
+            "and violations fire real-time channel notifications.",
+        ),
+      own: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Glob patterns constaining write scope (e.g. `[\"src/**\", \"docs/*\"]`). " +
+            "Agents get prompt-level blocking instructions; violations fire channel events.",
+        ),
+      preamble: z
+        .string()
+        .optional()
+        .describe(
+          "Shared context block every spawned agent receives before its prompt. " +
+            "Use for fan-out-level ground truth (library idioms, API contracts).",
+        ),
+      idle_ttl: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Auto-reap idle agents after N ms of inactivity (registry-level, 0 = off)."),
+      dead_ttl: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Auto-reap dead agents after N ms (registry-level, 0 = off)."),
+      exclusive: z
+        .array(
+          z.object({
+            pattern: z.string().describe("Case-insensitive regex over the command string."),
+            wait: z.boolean().default(true).describe("True = queue caller, False = reject immediately."),
+          }),
+        )
+        .optional()
+        .describe(
+          "Declare command patterns as exclusive across agents. Agents acquire/release locks " +
+            "via host_tool_call tools `exclusive_acquire`/`exclusive_release`. Only one agent " +
+            "holds each lock at a time.",
+        ),
     },
     annotations: {
       title: "Spawn pi subagent",
@@ -192,17 +297,189 @@ server.registerTool(
   },
   async (args) =>
     guard(async () => {
+      // ── Set registry-level TTL ──────────────────────────────────────
+      const idleTTL = args.idle_ttl ?? 0;
+      const deadTTL = args.dead_ttl ?? 0;
+      if (idleTTL > 0 || deadTTL > 0) {
+        registry.setTTL(idleTTL, deadTTL);
+      }
+      if (args.exclusive !== undefined && args.exclusive.length > 0) {
+        registry.setExclusive(args.exclusive);
+      }
+      // ── Spawn agent and wire options ────────────────────────────────
       const agent = await registry.spawn({
         agentId: args.agent_id,
         extraArgs: args.extra_args,
         cwd: args.cwd,
         rpcMode: args.rpc_mode,
       });
-      if (args.model) await agent.setModel(args.model.provider, args.model.modelId);
-      const claudeMdPrefix = collectClaudeMd(args.cwd);
+
+      // Wire denylist, own, preamble, fallbackModel, violation callback
+      if (args.denylist) agent.denylistRe.splice(0, agent.denylistRe.length, ...args.denylist.map((p: string) => new RegExp(p, "i")));
+      if (args.own) agent.own.splice(0, agent.own.length, ...args.own);
+      agent.preamble = args.preamble ?? null;
+      agent.fallbackModel = args.fallback_model ?? null;
+
+      // Wire violation callback → channel notification
+      agent.onViolation = (agentId, type, detail) => {
+        server.server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: type === "denied"
+              ? `[deleg8 BLOCKED] ${agentId}: tool "${detail.toolName}" matched denylist pattern /${detail.pattern}/`
+              : `[deleg8 SCOPE] ${agentId}: wrote "${detail.path}" outside scope (tool: ${detail.toolName})`,
+            meta: { agent_id: agentId, event: type === "denied" ? "denied_command" : "scope_violation", ...detail },
+          },
+        }).catch((err: Error) => console.error("[deleg8] onViolation notification failed:", err));
+      };
+
+      // Configure model
+      async function applyModel(model: { provider: string; modelId: string }): Promise<boolean> {
+        try {
+          await agent.setModel(model.provider, model.modelId);
+          return true;
+        } catch (e) {
+          const msg = (e as Error).message;
+          console.error(`[deleg8] model set failed for ${agent.agentId}: ${msg}`);
+          return false;
+        }
+      }
+
+      if (args.model) {
+        const ok = await applyModel(args.model);
+        if (!ok && args.fallback_model) {
+          console.error(`[deleg8] ${agent.agentId}: primary model failed, trying fallback`);
+          await applyModel(args.fallback_model);
+        }
+      }
+
+      // Wire channel notifications for this agent.
+      agent.onChannelFrame = (agentId, _frame, ftype) => {
+        if (ftype !== "agent_end") return;
+        const buf = agent.output({ maxFrames: 1000 });
+        const d = digest(buf, { lastMessages: 1 });
+        const lastMsg = d.messages[d.messages.length - 1];
+        const lastText = (typeof lastMsg?.data?.text === "string" ? lastMsg.data.text : "").trim().slice(0, 2000);
+        server.server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: lastText || `agent ${agentId} finished`,
+            meta: { agent_id: agentId, event: "agent_end" },
+          },
+        }).catch((err) => console.error("[deleg8] channel agent_end notification failed:", err));
+      };
+
+      // Wire host_tool_call handling: msg, task_create/update/list, exclusive_acquire/release.
+      agent.onHostRequest = async (agentId, request) => {
+        const req = request as Record<string, unknown>;
+        const tool = typeof req.tool === "string" ? req.tool : "";
+        const args = (req.args ?? {}) as Record<string, unknown>;
+        const id = typeof req.id === "string" ? req.id : "";
+
+        if (tool === "msg") {
+          const text = String(args.text ?? "").slice(0, 2000);
+          server.server.notification({
+            method: "notifications/claude/channel",
+            params: { content: text, meta: { agent_id: agentId, event: "msg" } },
+          }).catch((err) => console.error("[deleg8] channel msg notification failed:", err));
+          return { id, type: "host_tool_result", result: { ok: true } } as unknown as Frame;
+        }
+
+        if (tool === "task_create") {
+          taskSeq += 1;
+          const taskId = `task-${taskSeq}`;
+          const entry: TaskEntry = {
+            id: taskId,
+            agent_id: agentId,
+            label: String(args.label ?? "unnamed"),
+            status: "pending",
+            note: args.note !== undefined ? String(args.note) : undefined,
+            created_at: Date.now(),
+            updated_at: Date.now(),
+          };
+          taskMap.set(taskId, entry);
+          const createNote = entry.note ? ` — ${entry.note}` : "";
+          server.server.notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: `[${taskId}] created [${entry.status}] ${entry.label}${createNote}`,
+              meta: { agent_id: agentId, event: "task_create", task_id: taskId, task: entry },
+            },
+          }).catch((err) => console.error("[deleg8] channel task_create notification failed:", err));
+          return { id, type: "host_tool_result", result: entry } as unknown as Frame;
+        }
+
+        if (tool === "task_update") {
+          const taskId = String(args.task_id ?? "");
+          const entry = taskMap.get(taskId);
+          if (!entry) {
+            return { id, type: "host_tool_result", isError: true, result: { error: `task ${taskId} not found` } } as unknown as Frame;
+          }
+          if (args.status !== undefined) entry.status = args.status as TaskEntry["status"];
+          if (args.note !== undefined) entry.note = String(args.note);
+          entry.updated_at = Date.now();
+          const updateNote = entry.note ? ` — ${entry.note}` : "";
+          server.server.notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: `[${taskId}] [${entry.status}] ${entry.label}${updateNote}`,
+              meta: { agent_id: agentId, event: "task_update", task_id: taskId, task: entry },
+            },
+          }).catch((err) => console.error("[deleg8] channel task_update notification failed:", err));
+          return { id, type: "host_tool_result", result: entry } as unknown as Frame;
+        }
+
+        if (tool === "task_list") {
+          const filterAgent = typeof args.agent_id === "string" ? args.agent_id : undefined;
+          const tasks = [...taskMap.values()].filter((t) => !filterAgent || t.agent_id === filterAgent);
+          return { id, type: "host_tool_result", result: { count: tasks.length, tasks } } as unknown as Frame;
+        }
+
+        // ── Exclusive command lock tools ────────────────────────────
+        if (tool === "exclusive_acquire") {
+          const pattern = String(args.pattern ?? "");
+          if (!pattern) {
+            return { id, type: "host_tool_result", isError: true, result: { error: "exclusive_acquire requires a `pattern` argument" } } as unknown as Frame;
+          }
+          const acquired = registry.acquireExclusive(pattern, agentId);
+          server.server.notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: acquired
+                ? `[deleg8 LOCK] ${agentId} acquired exclusive lock on /${pattern}/i`
+                : `[deleg8 LOCK WAIT] ${agentId} queued for exclusive lock on /${pattern}/i`,
+              meta: { agent_id: agentId, event: "exclusive_acquire", pattern, acquired },
+            },
+          }).catch((err: Error) => console.error("[deleg8] exclusive_acquire notification failed:", err));
+          return { id, type: "host_tool_result", result: { acquired } } as unknown as Frame;
+        }
+
+        if (tool === "exclusive_release") {
+          const pattern = String(args.pattern ?? "");
+          if (!pattern) {
+            return { id, type: "host_tool_result", isError: true, result: { error: "exclusive_release requires a `pattern` argument" } } as unknown as Frame;
+          }
+          const nextHolder = registry.releaseExclusive(pattern, agentId);
+          server.server.notification({
+            method: "notifications/claude/channel",
+            params: {
+              content: nextHolder
+                ? `[deleg8 LOCK] ${agentId} released exclusive lock on /${pattern}/i → transferred to ${nextHolder}`
+                : `[deleg8 LOCK] ${agentId} released exclusive lock on /${pattern}/i (no waiters)`,
+              meta: { agent_id: agentId, event: "exclusive_release", pattern, next_holder: nextHolder },
+            },
+          }).catch((err: Error) => console.error("[deleg8] exclusive_release notification failed:", err));
+          return { id, type: "host_tool_result", result: { released: true, next_holder: nextHolder } } as unknown as Frame;
+        }
+
+        return null; // unknown tool — fall through to default error response
+      };
+
       let response: unknown = null;
       if (args.initial_prompt) {
-        const prompt = claudeMdPrefix + args.initial_prompt;
+        const constraintBlock = buildConstraintBlock(args.denylist, args.own, args.preamble);
+        let prompt = constraintBlock + args.initial_prompt;
+        if (args.role === "leaf") prompt = LEAF_ROLE_PREAMBLE + prompt;
         if (args.background) {
           await agent.sendPrompt(prompt, { wait: false });
         } else {
@@ -282,8 +559,9 @@ server.registerTool(
   {
     title: "List pi subagents",
     description:
-      "Snapshot of every registered pi agent. Each entry has `state` (running | idle | dead) " +
-      "and `session_id`. `idle` means the subprocess has exited at end-of-turn but the omp " +
+      "Snapshot of every registered pi agent. Each entry has `state` (running | idle | dead), " +
+      "`session_id`, and `total_cost_usd` (summed across the agent's buffered frames). " +
+      "`idle` means the subprocess has exited at end-of-turn but the omp " +
       "session is on disk and resumable via send. `dead` means the agent crashed or was " +
       "stopped — registry entry persists for inspection until prune. Mirrors TaskList. " +
       "Pass `jq` to project (e.g. `.agents | map({id: .agent_id, state})`).",
@@ -300,7 +578,7 @@ server.registerTool(
   },
   async (args) =>
     guard(async () => {
-      const agents = registry.list().map((a) => a.status());
+      const agents = registry.list().map((a) => ({ ...a.status(), total_cost_usd: a.costUsd() }));
       const result = await project({ count: agents.length, agents }, args.jq);
       return ok(result);
     }),
@@ -314,7 +592,8 @@ server.registerTool(
     title: "Get status of one pi subagent",
     description:
       "Detailed status for a single agent — `state` (running | idle | dead), `pid`, " +
-      "`session_id`, `session_file`, `last_activity`, `message_count`, `log_path`. " +
+      "`session_id`, `session_file`, `last_activity`, `message_count`, `log_path`, " +
+      "`total_cost_usd` (summed across the agent's buffered frames). " +
       "Mirrors TaskGet. Pass `jq` to project (e.g. `.status | {state, session_id, log_path}`).",
     inputSchema: {
       agent_id: z.string(),
@@ -331,7 +610,8 @@ server.registerTool(
   async (args) =>
     guard(async () => {
       const agent = registry.get(args.agent_id);
-      const result = await project({ agent_id: args.agent_id, status: agent.status() }, args.jq);
+      const status = { ...agent.status(), total_cost_usd: agent.costUsd() };
+      const result = await project({ agent_id: args.agent_id, status }, args.jq);
       return ok(result);
     }),
 );
@@ -391,11 +671,17 @@ server.registerTool(
       let payload: Record<string, unknown>;
       if (args.format === "digest") {
         const d = digest(agent.output({ maxFrames: 1000 }), { lastMessages: args.last_messages });
+        // The digest only sees the last 1000 buffered frames (itself capped at
+        // BUFFER_CAP=1024 total), so long sessions evict early tool calls
+        // before a digest is ever requested. agent.modifiedFiles is populated
+        // durably at frame-intake time and survives that eviction — union it
+        // in so modified_files reflects the whole session, not just the tail.
+        const modified_files = Array.from(new Set([...d.modified_files, ...agent.modifiedFiles])).sort();
         payload = {
           agent_id: args.agent_id,
           format: "digest",
           full_output_path: agent.getLogPath(),
-          modified_files: d.modified_files,
+          modified_files,
           messages: d.messages,
           total_assistant_messages: d.total_assistant_messages,
           total_entries: d.total_entries,
@@ -489,6 +775,133 @@ server.registerTool(
       return ok({ removed, count: removed.length });
     }),
 );
+
+// ── tasks ────────────────────────────────────────────────────────────────
+
+server.registerTool(
+  "tasks",
+  {
+    title: "Query agent task registry",
+    description:
+      "List or get tasks created by agents via host_tool_call task_create/task_update. " +
+      "Agents use this to surface sub-work tracking back to the orchestrator.",
+    inputSchema: {
+      agent_id: z.string().optional().describe("Filter by agent_id. Omit for all tasks."),
+      task_id: z.string().optional().describe("Get a specific task by ID."),
+      jq: z.string().optional().describe("Optional jq -c filter applied to the result."),
+    },
+    annotations: {
+      title: "Query agent tasks",
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  },
+  async (args) =>
+    guard(async () => {
+      if (args.task_id) {
+        const entry = taskMap.get(args.task_id);
+        if (!entry) return fail(`task ${args.task_id} not found`);
+        const result = await project({ task: entry }, args.jq);
+        return ok(result);
+      }
+      const tasks = args.agent_id
+        ? [...taskMap.values()].filter((t) => t.agent_id === args.agent_id)
+        : [...taskMap.values()];
+      const result = await project({ count: tasks.length, tasks }, args.jq);
+      return ok(result);
+    }),
+);
+
+  // ── task_create ──────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "task_create",
+    {
+      title: "Create a task in the registry",
+      description: "Create a task to track subagent progress. Exposed to the orchestrator.",
+      inputSchema: {
+        agent_id: z.string().describe("Agent ID this task belongs to."),
+        label: z.string().describe("Task label (5-10 words)."),
+        note: z.string().optional().describe("Optional note detailing the task."),
+      },
+      annotations: {
+        title: "Create task",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (args) =>
+      guard(async () => {
+        taskSeq += 1;
+        const taskId = `task-${taskSeq}`;
+        const entry: TaskEntry = {
+          id: taskId,
+          agent_id: args.agent_id,
+          label: args.label,
+          status: "pending",
+          note: args.note,
+          created_at: Date.now(),
+          updated_at: Date.now(),
+        };
+        taskMap.set(taskId, entry);
+
+        // Fire notification so Claude Code UI updates/logs it
+        server.server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: `[${taskId}] created [pending] ${entry.label}${entry.note ? ` — ${entry.note}` : ""}`,
+            meta: { agent_id: args.agent_id, event: "task_create", task_id: taskId, task: entry },
+          },
+        }).catch((err) => console.error("[deleg8] host task_create notification failed:", err));
+
+        return ok(entry);
+      }),
+  );
+
+  // ── task_update ──────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "task_update",
+    {
+      title: "Update a task status in the registry",
+      description: "Update the status or note of a task. Exposed to the orchestrator.",
+      inputSchema: {
+        task_id: z.string().describe("Task ID to update."),
+        status: z.enum(["pending", "in_progress", "done", "failed"]).optional().describe("New status."),
+        note: z.string().optional().describe("Updated note."),
+      },
+      annotations: {
+        title: "Update task",
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (args) =>
+      guard(async () => {
+        const entry = taskMap.get(args.task_id);
+        if (!entry) return fail(`task ${args.task_id} not found`);
+        if (args.status !== undefined) entry.status = args.status;
+        if (args.note !== undefined) entry.note = args.note;
+        entry.updated_at = Date.now();
+
+        // Fire notification
+        server.server.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: `[${args.task_id}] [${entry.status}] ${entry.label}${entry.note ? ` — ${entry.note}` : ""}`,
+            meta: { agent_id: entry.agent_id, event: "task_update", task_id: args.task_id, task: entry },
+          },
+        }).catch((err) => console.error("[deleg8] host task_update notification failed:", err));
+
+        return ok(entry);
+      }),
+  );
 
 // ── resource: schema/frames ─────────────────────────────────────────────
 

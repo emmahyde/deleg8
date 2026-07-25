@@ -12,6 +12,27 @@ export interface RegistryOptions {
   onUIRequest?: (req: Frame) => Promise<Frame | null>;
   /** Directory each agent writes its `<agentId>.log` NDJSON into. Omit to disable logging. */
   logDir?: string;
+  /**
+   * Auto-reap idle agents after N ms of inactivity after their last agent_end.
+   * 0 (default) = no auto-reap.
+   */
+  idleTTL?: number;
+  /**
+   * Auto-reap dead agents after N ms. 0 (default) = no auto-reap.
+   */
+  deadTTL?: number;
+  /**
+   * Called when an agent is auto-reaped (idle/dead TTL expiry).
+   */
+  onReap?: (agentId: string, state: "idle" | "dead") => void;
+  /**
+   * Declare command patterns as exclusive — only one agent may hold the lock
+   * at a time. Agents acquire/release via the `exclusive_acquire` /
+   * `exclusive_release` host tools (wired by the spawn handler).
+   * `pattern` is a case-insensitive regex matched against the command string;
+   * `wait: true` queues the caller, `wait: false` rejects immediately.
+   */
+  exclusive?: Array<{ pattern: string; wait: boolean }>;
 }
 
 export interface SpawnOptions {
@@ -26,11 +47,126 @@ export class AgentRegistry {
   private readonly binary: string;
   private readonly onUIRequest: ((req: Frame) => Promise<Frame | null>) | undefined;
   private readonly logDir: string | undefined;
+  private idleTTL: number;
+  private deadTTL: number;
+  private readonly onReap: ((agentId: string, state: "idle" | "dead") => void) | undefined;
+  readonly exclusive: ReadonlyArray<{ pattern: string; wait: boolean }>;
+
+  /** Maps exclusive pattern → agentId currently holding the lock. */
+  readonly exclusiveLocks: Map<string, string> = new Map();
+  /** Maps exclusive pattern → queue of agentIds waiting for the lock (wait: true only). */
+  readonly exclusiveQueue: Map<string, string[]> = new Map();
+
+  /** Pre-compiled exclusive-pattern regexes for fast matching. */
+  private readonly exclusiveRe: Array<{ compiled: RegExp; wait: boolean; pattern: string }> = [];
+
+  private reapInterval: Timer | null = null;
 
   constructor(opts: RegistryOptions = {}) {
     this.binary = opts.binary ?? "omp";
     this.onUIRequest = opts.onUIRequest;
     this.logDir = opts.logDir;
+    this.idleTTL = opts.idleTTL ?? 0;
+    this.deadTTL = opts.deadTTL ?? 0;
+    this.onReap = opts.onReap;
+    this.exclusive = opts.exclusive ?? [];
+    this.exclusiveRe = opts.exclusive?.map((e) => ({
+      compiled: new RegExp(e.pattern, "i"),
+      wait: e.wait,
+      pattern: e.pattern,
+    })) ?? [];
+    if (this.idleTTL > 0 || this.deadTTL > 0) {
+      this.startReap();
+    }
+  }
+
+  /** Update idle/dead TTL at runtime (e.g. from spawn config). */
+  setTTL(idleTTL: number, deadTTL: number): void {
+    this.idleTTL = idleTTL;
+    this.deadTTL = deadTTL;
+    if ((idleTTL > 0 || deadTTL > 0) && !this.reapInterval) {
+      this.startReap();
+    }
+  }
+
+  /** Update exclusive patterns at runtime. */
+  setExclusive(patterns: Array<{ pattern: string; wait: boolean }>): void {
+    this.exclusiveRe.splice(0, this.exclusiveRe.length, ...patterns.map((e) => ({
+      compiled: new RegExp(e.pattern, "i"),
+      wait: e.wait,
+      pattern: e.pattern,
+    })));
+    (this.exclusive as any).splice(0, this.exclusive.length, ...patterns);
+  }
+
+  /**
+   * Check whether a command string matches any registered exclusive pattern.
+   * Returns the matching entry or null.
+   */
+  matchExclusive(command: string): { pattern: string; wait: boolean; compiled: RegExp } | null {
+    for (const entry of this.exclusiveRe) {
+      if (entry.compiled.test(command)) return entry;
+    }
+    return null;
+  }
+
+  /**
+   * Attempt to acquire an exclusive lock. Returns true if acquired, false if
+   * another agent already holds it (queue the caller if wait: true).
+   */
+  acquireExclusive(pattern: string, agentId: string): boolean {
+    const holder = this.exclusiveLocks.get(pattern);
+    if (holder === agentId) return true; // already held by this agent
+    if (holder !== undefined) {
+      // Someone else holds the lock — queue if wait: true
+      const info = this.exclusiveRe.find((e) => e.pattern === pattern);
+      if (info?.wait) {
+        const queue = this.exclusiveQueue.get(pattern) ?? [];
+        if (!queue.includes(agentId)) queue.push(agentId);
+        this.exclusiveQueue.set(pattern, queue);
+      }
+      return false;
+    }
+    this.exclusiveLocks.set(pattern, agentId);
+    return true;
+  }
+
+  /**
+   * Release an exclusive lock. If a queued agent is waiting, it acquires next.
+   * Returns the agentId that now holds the lock, or null if no one is waiting.
+   */
+  releaseExclusive(pattern: string, agentId: string): string | null {
+    const holder = this.exclusiveLocks.get(pattern);
+    if (holder !== agentId) return null; // not the holder — no-op
+    this.exclusiveLocks.delete(pattern);
+
+    // Dequeue next waiter
+    const queue = this.exclusiveQueue.get(pattern);
+    if (queue && queue.length > 0) {
+      const next = queue.shift()!;
+      if (queue.length === 0) this.exclusiveQueue.delete(pattern);
+      else this.exclusiveQueue.set(pattern, queue);
+      this.exclusiveLocks.set(pattern, next);
+      return next;
+    }
+    return null;
+  }
+
+  /**
+   * Release every exclusive lock held by `agentId`. Called on stop/remove.
+   */
+  releaseAgentLocks(agentId: string): void {
+    for (const [pattern, holder] of this.exclusiveLocks) {
+      if (holder === agentId) {
+        this.releaseExclusive(pattern, agentId);
+      }
+    }
+    // Also clean any queue entries referencing this agent
+    for (const [pattern, queue] of this.exclusiveQueue) {
+      const filtered = queue.filter((id) => id !== agentId);
+      if (filtered.length === 0) this.exclusiveQueue.delete(pattern);
+      else this.exclusiveQueue.set(pattern, filtered);
+    }
   }
 
   async spawn(opts: SpawnOptions = {}): Promise<PiAgent> {
@@ -41,10 +177,6 @@ export class AgentRegistry {
     const existing = this.agents.get(aid);
     if (existing) {
       const state = existing.status().state;
-      // running: refuse — same id can't have two live procs.
-      // idle: refuse — agent is paused mid-session; caller should pi_send
-      //   to resume or pi_stop({remove: true}) to discard.
-      // dead: ok to replace transparently — proc gone and no resumable session.
       if (state !== "dead") {
         throw new PiAgentError(
           `agent ${aid} already exists (state=${state}). ` +
@@ -79,11 +211,15 @@ export class AgentRegistry {
   }
 
   async stop(agentId: string, opts: { force?: boolean } = {}): Promise<number | null> {
-    return await this.get(agentId).stop({ force: opts.force });
+    const agent = this.get(agentId);
+    const code = await agent.stop({ force: opts.force });
+    this.releaseAgentLocks(agentId);
+    return code;
   }
 
   remove(agentId: string): void {
     this.agents.delete(agentId);
+    this.releaseAgentLocks(agentId);
   }
 
   /** Remove every agent matching one of the given states. Returns removed ids. */
@@ -92,6 +228,7 @@ export class AgentRegistry {
     for (const [id, agent] of this.agents) {
       if (states.includes(agent.status().state as "idle" | "dead")) {
         this.agents.delete(id);
+        this.releaseAgentLocks(id);
         removed.push(id);
       }
     }
@@ -100,6 +237,39 @@ export class AgentRegistry {
 
   async stopAll(opts: { force?: boolean } = {}): Promise<void> {
     await Promise.allSettled(this.list().map((a) => a.stop({ force: opts.force })));
+    this.exclusiveLocks.clear();
+    this.exclusiveQueue.clear();
+  }
+
+  // ── auto-reap ─────────────────────────────────────────────────────────
+
+  private startReap(): void {
+    if (this.reapInterval) return;
+    this.reapInterval = setInterval(() => this.tickReap(), 10_000).unref();
+  }
+
+  stopReap(): void {
+    if (this.reapInterval) {
+      clearInterval(this.reapInterval);
+      this.reapInterval = null;
+    }
+  }
+
+  private tickReap(): void {
+    const now = Date.now();
+    for (const [id, agent] of this.agents) {
+      const s = agent.status();
+      const sinceLast = now - s.last_activity;
+      if (s.state === "idle" && this.idleTTL > 0 && sinceLast > this.idleTTL) {
+        this.agents.delete(id);
+        this.releaseAgentLocks(id);
+        this.onReap?.(id, "idle");
+      } else if (s.state === "dead" && this.deadTTL > 0 && sinceLast > this.deadTTL) {
+        this.agents.delete(id);
+        this.releaseAgentLocks(id);
+        this.onReap?.(id, "dead");
+      }
+    }
   }
 
   private autoId(): string {
