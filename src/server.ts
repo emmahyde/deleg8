@@ -3,6 +3,7 @@
 // long-lived subagents addressable from Claude Code.
 
 import { randomUUID } from "node:crypto";
+import { readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -996,6 +997,42 @@ server.registerResource(
 
 // ── boot ────────────────────────────────────────────────────────────────
 
+/**
+ * Delete session log dirs under `root` whose newest top-level entry is older
+ * than `maxAgeMs`. Age is judged from the dir's own mtime plus its immediate
+ * children only — agent activity always appends to a top-level `<id>.log`,
+ * so a live session can never look stale. The `keep` dir (current session)
+ * is never removed. Returns the names of removed dirs.
+ */
+export function reapOldSessionDirs(root: string, keep: string, maxAgeMs: number): string[] {
+  const removed: string[] = [];
+  let entries;
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return removed;
+  }
+  const cutoff = Date.now() - maxAgeMs;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name === keep) continue;
+    const dir = join(root, entry.name);
+    try {
+      let newest = statSync(dir).mtimeMs;
+      for (const child of readdirSync(dir)) {
+        const m = statSync(join(dir, child)).mtimeMs;
+        if (m > newest) newest = m;
+      }
+      if (newest < cutoff) {
+        rmSync(dir, { recursive: true, force: true });
+        removed.push(entry.name);
+      }
+    } catch {
+      // Unreadable or vanished mid-scan — leave it for the next boot.
+    }
+  }
+  return removed;
+}
+
 async function main(): Promise<void> {
   const sessionId = process.env.CLAUDE_SESSION_ID ?? randomUUID().slice(0, 8);
   // DELEG8_LOG_DIR overrides the default ~/.claude/deleg8/<session>/ path —
@@ -1012,6 +1049,23 @@ async function main(): Promise<void> {
   console.error(
     `deleg8 ready (binary=${process.env.OMP_BIN ?? "omp"}, session=${sessionId}, logs=${sessionLogDir})`,
   );
+
+  // Log rotation: reap stale sibling session dirs (4.1G accumulated in two
+  // days before this existed). Only under the default root — a DELEG8_LOG_DIR
+  // override (tests) points at a dir whose siblings aren't ours to delete.
+  if (process.env.DELEG8_LOG_DIR === undefined) {
+    const maxAgeDays = envNonNegInt("DELEG8_LOG_MAX_AGE_DAYS") ?? 3;
+    if (maxAgeDays > 0) {
+      const removed = reapOldSessionDirs(
+        join(homedir(), ".claude", "deleg8"),
+        sessionId,
+        maxAgeDays * 86_400_000,
+      );
+      if (removed.length > 0) {
+        console.error(`deleg8: reaped ${removed.length} stale session log dir(s): ${removed.join(", ")}`);
+      }
+    }
+  }
 
   // Last-resort cleanup: when Claude Code dies (graceful or otherwise), kill every
   // omp subprocess we spawned. Three independent triggers, any one of which fires:

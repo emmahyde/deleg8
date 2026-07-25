@@ -4,7 +4,7 @@
 // deleg8's resumable lifecycle promises.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -13,7 +13,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 
 import { PiAgent } from "../src/agent.ts";
 import { AgentRegistry } from "../src/registry.ts";
-import { createPiAgentServer } from "../src/server.ts";
+import { createPiAgentServer, reapOldSessionDirs } from "../src/server.ts";
 
 const MOCK_PATH = new URL("./fixtures/mock-omp.ts", import.meta.url).pathname;
 
@@ -186,4 +186,42 @@ describe("deleg8 MCP server integration", () => {
     },
     15_000,
   );
+});
+
+describe("reapOldSessionDirs", () => {
+  test("removes stale dirs, keeps fresh dirs and the current session", () => {
+    const root = mkdtempSync(join(tmpdir(), "deleg8-reap-"));
+    const old = new Date(Date.now() - 8 * 86_400_000);
+
+    // Stale: dir and its contents both older than the cutoff.
+    mkdirSync(join(root, "stale"));
+    writeFileSync(join(root, "stale", "a.log"), "x");
+    utimesSync(join(root, "stale", "a.log"), old, old);
+    utimesSync(join(root, "stale"), old, old);
+
+    // Fresh: recent write keeps it alive.
+    mkdirSync(join(root, "fresh"));
+    writeFileSync(join(root, "fresh", "a.log"), "x");
+
+    // Current session: stale by age but protected by `keep`.
+    mkdirSync(join(root, "current"));
+    utimesSync(join(root, "current"), old, old);
+
+    // Non-directory entries at the root are ignored.
+    writeFileSync(join(root, "stray.txt"), "x");
+    utimesSync(join(root, "stray.txt"), old, old);
+
+    const removed = reapOldSessionDirs(root, "current", 3 * 86_400_000);
+    expect(removed).toEqual(["stale"]);
+    expect(existsSync(join(root, "stale"))).toBe(false);
+    expect(existsSync(join(root, "fresh"))).toBe(true);
+    expect(existsSync(join(root, "current"))).toBe(true);
+    expect(existsSync(join(root, "stray.txt"))).toBe(true);
+
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("missing root is a no-op", () => {
+    expect(reapOldSessionDirs("/nonexistent/deleg8-reap-test", "x", 1000)).toEqual([]);
+  });
 });
