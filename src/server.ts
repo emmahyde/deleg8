@@ -2,8 +2,9 @@
 // deleg8 — exposes oh-my-pi (`omp --mode rpc`) as a fleet of named,
 // long-lived subagents addressable from Claude Code.
 
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readdirSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -109,6 +110,41 @@ function cleanupAgentTasks(taskMap: Map<string, TaskEntry>, agentId: string): vo
   }
 }
 
+/**
+ * Cross-session NDJSON feed of every channel notification. Channel frames are
+ * silently discarded by Claude Code sessions launched without
+ * --dangerously-load-development-channels (all background jobs) — the send
+ * "succeeds", so the enqueue-on-failure path never fires. This file is the
+ * delivery path that cannot be filtered: any session can tail or grep it.
+ */
+const GLOBAL_EVENTS_PATH = join(homedir(), ".claude", "deleg8", "events-global.ndjson");
+
+function appendGlobalEvent(sessionLogDir: string | undefined, method: string, params: Record<string, unknown>): void {
+  try {
+    mkdirSync(dirname(GLOBAL_EVENTS_PATH), { recursive: true });
+    const session = sessionLogDir === undefined ? null : sessionLogDir.split("/").pop() ?? null;
+    appendFileSync(GLOBAL_EVENTS_PATH, JSON.stringify({ ts: Date.now(), session, method, params }) + "\n", "utf8");
+  } catch (error) {
+    console.error("[deleg8] global event append failed:", error);
+  }
+}
+
+/** macOS banner for agent_end — reaches the user even when no session can. */
+function emitDesktopNotification(title: string, body: string): void {
+  if (process.platform !== "darwin" || process.env.DELEG8_NO_DESKTOP_NOTIFY) return;
+  const esc = (s: string) => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  try {
+    const child = spawn(
+      "osascript",
+      ["-e", `display notification "${esc(body.slice(0, 160))}" with title "${esc(title)}" sound name "Ping"`],
+      { stdio: "ignore", detached: true },
+    );
+    child.unref();
+  } catch (error) {
+    console.error("[deleg8] desktop notification failed:", error);
+  }
+}
+
 async function sendNotification(
   server: McpServer,
   sessionLogDir: string | undefined,
@@ -116,6 +152,12 @@ async function sendNotification(
   params: Record<string, unknown>,
   label: string,
 ): Promise<void> {
+  appendGlobalEvent(sessionLogDir, method, params);
+  const meta = params.meta as Record<string, unknown> | undefined;
+  if (meta?.event === "agent_end") {
+    const content = typeof params.content === "string" ? params.content : "agent finished";
+    emitDesktopNotification(`deleg8: ${String(meta.agent_id ?? "agent")} done`, content);
+  }
   try {
     await server.server.notification({ method, params });
   } catch (error) {
