@@ -5,7 +5,7 @@
 import { randomUUID } from "node:crypto";
 import { readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -14,6 +14,7 @@ import { PiAgentError, type PiAgent } from "./agent.ts";
 import type { Frame } from "./frames.ts";
 import { jqFilter } from "./jq-filter.ts";
 import { AgentRegistry } from "./registry.ts";
+import { drainEvents, enqueueEvent } from "./persist.ts";
 import { FRAME_SCHEMA } from "./schema.ts";
 import { digest, extractTextContent, summarize } from "./summarize.ts";
 import { makeElicitBridge } from "./ui-bridge.ts";
@@ -42,6 +43,7 @@ function envNonNegInt(name: string): number | undefined {
 export interface PiAgentServerHandle {
   server: McpServer;
   registry: AgentRegistry;
+  wireAgent: (agent: PiAgent) => void;
 }
 
 export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentServerHandle {
@@ -64,17 +66,18 @@ export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentSer
   // logs from the same session land together; otherwise a short generated id.
   const sessionId = process.env.CLAUDE_SESSION_ID ?? randomUUID().slice(0, 8);
   const defaultLogDir = join(homedir(), ".claude", "deleg8", sessionId);
+  const sessionLogDir = opts.logDir ?? defaultLogDir;
   const registry =
     opts.registry ??
     new AgentRegistry({
       binary: opts.binary ?? process.env.OMP_BIN ?? "omp",
       onUIRequest: makeElicitBridge(server),
-      logDir: opts.logDir ?? defaultLogDir,
+      logDir: sessionLogDir,
       maxAgents: opts.maxAgents ?? envNonNegInt("DELEG8_MAX_AGENTS"),
       minFreeMemPct: opts.minFreeMemPct ?? envNonNegInt("DELEG8_MIN_FREE_MEM_PCT"),
     });
-  registerTools(server, registry);
-  return { server, registry };
+  const wireAgent = registerTools(server, registry, registry.getLogDir() ?? sessionLogDir);
+  return { server, registry, wireAgent };
 }
 
 // ── task registry ───────────────────────────────────────────────────────────
@@ -105,7 +108,27 @@ function cleanupAgentTasks(taskMap: Map<string, TaskEntry>, agentId: string): vo
     if (entry.agent_id === agentId) taskMap.delete(id);
   }
 }
-function registerTools(server: McpServer, registry: AgentRegistry): void {
+
+async function sendNotification(
+  server: McpServer,
+  sessionLogDir: string | undefined,
+  method: string,
+  params: Record<string, unknown>,
+  label: string,
+): Promise<void> {
+  try {
+    await server.server.notification({ method, params });
+  } catch (error) {
+    console.error(`[deleg8] ${label} notification failed:`, error);
+    if (sessionLogDir === undefined) return;
+    try {
+      enqueueEvent(sessionLogDir, { method, params });
+    } catch (queueError) {
+      console.error(`[deleg8] could not queue ${label} notification:`, queueError);
+    }
+  }
+}
+function registerTools(server: McpServer, registry: AgentRegistry, sessionLogDir?: string): (agent: PiAgent) => void {
   const taskMap = new Map<string, TaskEntry>();
   let taskSeq = 0;
 
@@ -205,6 +228,145 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
     return fail(`unexpected: ${msg}`);
   }
 }
+  const notify = (
+    method: string,
+    params: Record<string, unknown>,
+    label: string,
+  ): Promise<void> => sendNotification(server, sessionLogDir, method, params, label);
+
+  const handleHostRequest = async (agentId: string, request: Frame): Promise<Frame | null> => {
+    const req = request as Record<string, unknown>;
+    const tool = typeof req.tool === "string" ? req.tool : "";
+    const args = (req.args ?? {}) as Record<string, unknown>;
+    const id = typeof req.id === "string" ? req.id : "";
+
+    if (tool === "task_create") {
+      const agentTaskCount = [...taskMap.values()].filter((t) => t.agent_id === agentId).length;
+      if (agentTaskCount >= MAX_TASKS_PER_AGENT) {
+        return { id, type: "host_tool_result", isError: true, result: { error: `task limit reached (${MAX_TASKS_PER_AGENT} per agent)` } } as unknown as Frame;
+      }
+      taskSeq += 1;
+      const taskId = `task-${taskSeq}`;
+      const entry: TaskEntry = {
+        id: taskId,
+        agent_id: agentId,
+        label: String(args.label ?? "unnamed").slice(0, MAX_TASK_LABEL_BYTES),
+        status: "pending",
+        note: args.note !== undefined ? String(args.note).slice(0, MAX_TASK_NOTE_BYTES) : undefined,
+        created_at: Date.now(),
+        updated_at: Date.now(),
+      };
+      taskMap.set(taskId, entry);
+      const createNote = entry.note ? ` — ${entry.note}` : "";
+      void notify(
+        "notifications/claude/channel",
+        {
+          content: `[${taskId}] created [${entry.status}] ${entry.label}${createNote}`,
+          meta: { agent_id: agentId, event: "task_create", task_id: taskId, task: entry },
+        },
+        "channel task_create",
+      );
+      return { id, type: "host_tool_result", result: entry } as unknown as Frame;
+    }
+    if (tool === "task_update") {
+      const taskId = String(args.task_id ?? "");
+      const entry = taskMap.get(taskId);
+      if (!entry) {
+        return { id, type: "host_tool_result", isError: true, result: { error: `task ${taskId} not found` } } as unknown as Frame;
+      }
+      if (args.status !== undefined) entry.status = args.status as TaskEntry["status"];
+      if (args.note !== undefined) entry.note = String(args.note);
+      entry.updated_at = Date.now();
+      const updateNote = entry.note ? ` — ${entry.note}` : "";
+      void notify(
+        "notifications/claude/channel",
+        {
+          content: `[${taskId}] [${entry.status}] ${entry.label}${updateNote}`,
+          meta: { agent_id: agentId, event: "task_update", task_id: taskId, task: entry },
+        },
+        "channel task_update",
+      );
+      return { id, type: "host_tool_result", result: entry } as unknown as Frame;
+    }
+
+    if (tool === "task_list") {
+      const filterAgent = typeof args.agent_id === "string" ? args.agent_id : undefined;
+      const tasks = [...taskMap.values()].filter((t) => !filterAgent || t.agent_id === filterAgent);
+      return { id, type: "host_tool_result", result: { count: tasks.length, tasks } } as unknown as Frame;
+    }
+
+    if (tool === "exclusive_acquire") {
+      const pattern = String(args.pattern ?? "");
+      if (!pattern) {
+        return { id, type: "host_tool_result", isError: true, result: { error: "exclusive_acquire requires a `pattern` argument" } } as unknown as Frame;
+      }
+      const acquired = registry.acquireExclusive(pattern, agentId);
+      void notify(
+        "notifications/claude/channel",
+        {
+          content: acquired
+            ? `[deleg8 LOCK] ${agentId} acquired exclusive lock on /${pattern}/i`
+            : `[deleg8 LOCK WAIT] ${agentId} queued for exclusive lock on /${pattern}/i`,
+          meta: { agent_id: agentId, event: "exclusive_acquire", pattern, acquired },
+        },
+        "exclusive_acquire",
+      );
+      return { id, type: "host_tool_result", result: { acquired } } as unknown as Frame;
+    }
+
+    if (tool === "exclusive_release") {
+      const pattern = String(args.pattern ?? "");
+      if (!pattern) {
+        return { id, type: "host_tool_result", isError: true, result: { error: "exclusive_release requires a `pattern` argument" } } as unknown as Frame;
+      }
+      const nextHolder = registry.releaseExclusive(pattern, agentId);
+      void notify(
+        "notifications/claude/channel",
+        {
+          content: nextHolder
+            ? `[deleg8 LOCK] ${agentId} released exclusive lock on /${pattern}/i → transferred to ${nextHolder}`
+            : `[deleg8 LOCK] ${agentId} released exclusive lock on /${pattern}/i (no waiters)`,
+          meta: { agent_id: agentId, event: "exclusive_release", pattern, next_holder: nextHolder },
+        },
+        "exclusive_release",
+      );
+      return { id, type: "host_tool_result", result: { released: true, next_holder: nextHolder } } as unknown as Frame;
+    }
+
+    return null;
+  };
+
+  const wireAgent = (agent: PiAgent): void => {
+    agent.onViolation = (agentId, type, detail) => {
+      void notify(
+        "notifications/claude/channel",
+        {
+          content: type === "denied"
+            ? `[deleg8 BLOCKED] ${agentId}: tool "${detail.toolName}" matched denylist pattern /${detail.pattern}/`
+            : `[deleg8 SCOPE] ${agentId}: wrote "${detail.path}" outside scope (tool: ${detail.toolName})`,
+          meta: { agent_id: agentId, event: type === "denied" ? "denied_command" : "scope_violation", ...detail },
+        },
+        "onViolation",
+      );
+    };
+    agent.onChannelFrame = (agentId, _frame, ftype) => {
+      if (ftype !== "agent_end") return;
+      const buf = agent.output({ maxFrames: 1000 });
+      const d = digest(buf, { lastMessages: 1 });
+      const lastMsg = d.messages[d.messages.length - 1];
+      const lastText = (typeof lastMsg?.data?.text === "string" ? lastMsg.data.text : "").trim().slice(0, 2000);
+      void notify(
+        "notifications/claude/channel",
+        {
+          content: lastText || `agent ${agentId} finished`,
+          meta: { agent_id: agentId, event: "agent_end" },
+        },
+        "channel agent_end",
+      );
+    };
+    agent.onHostRequest = handleHostRequest;
+  };
+
 // ── spawn ────────────────────────────────────────────────────────────
 
 server.registerTool(
@@ -364,19 +526,8 @@ server.registerTool(
       if (args.own) agent.own.splice(0, agent.own.length, ...args.own);
       agent.preamble = args.preamble ?? null;
       agent.fallbackModel = args.fallback_model ?? null;
+      wireAgent(agent);
 
-      // Wire violation callback → channel notification
-      agent.onViolation = (agentId, type, detail) => {
-        server.server.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: type === "denied"
-              ? `[deleg8 BLOCKED] ${agentId}: tool "${detail.toolName}" matched denylist pattern /${detail.pattern}/`
-              : `[deleg8 SCOPE] ${agentId}: wrote "${detail.path}" outside scope (tool: ${detail.toolName})`,
-            meta: { agent_id: agentId, event: type === "denied" ? "denied_command" : "scope_violation", ...detail },
-          },
-        }).catch((err: Error) => console.error("[deleg8] onViolation notification failed:", err));
-      };
 
       // Configure model
       async function applyModel(model: { provider: string; modelId: string }): Promise<boolean> {
@@ -398,124 +549,9 @@ server.registerTool(
         }
       }
 
-      // Wire channel notifications for this agent.
-      agent.onChannelFrame = (agentId, _frame, ftype) => {
-        if (ftype !== "agent_end") return;
-        const buf = agent.output({ maxFrames: 1000 });
-        const d = digest(buf, { lastMessages: 1 });
-        const lastMsg = d.messages[d.messages.length - 1];
-        const lastText = (typeof lastMsg?.data?.text === "string" ? lastMsg.data.text : "").trim().slice(0, 2000);
-        server.server.notification({
-          method: "notifications/claude/channel",
-          params: {
-            content: lastText || `agent ${agentId} finished`,
-            meta: { agent_id: agentId, event: "agent_end" },
-          },
-        }).catch((err) => console.error("[deleg8] channel agent_end notification failed:", err));
-      };
       // Clean up tasks for finished agents
       cleanupAgentTasks(taskMap, agent.agentId);
 
-      // Wire host_tool_call handling: msg, task_create/update/list, exclusive_acquire/release.
-      agent.onHostRequest = async (agentId, request) => {
-        const req = request as Record<string, unknown>;
-        const tool = typeof req.tool === "string" ? req.tool : "";
-        const args = (req.args ?? {}) as Record<string, unknown>;
-        const id = typeof req.id === "string" ? req.id : "";
-
-        if (tool === "task_create") {
-          // Enforce per-agent task cap
-          const agentTaskCount = [...taskMap.values()].filter((t) => t.agent_id === agentId).length;
-          if (agentTaskCount >= MAX_TASKS_PER_AGENT) {
-            return { id, type: "host_tool_result", isError: true, result: { error: `task limit reached (${MAX_TASKS_PER_AGENT} per agent)` } } as unknown as Frame;
-          }
-          taskSeq += 1;
-          const taskId = `task-${taskSeq}`;
-          const entry: TaskEntry = {
-            id: taskId,
-            agent_id: agentId,
-            label: String(args.label ?? "unnamed").slice(0, MAX_TASK_LABEL_BYTES),
-            status: "pending",
-            note: args.note !== undefined ? String(args.note).slice(0, MAX_TASK_NOTE_BYTES) : undefined,
-            created_at: Date.now(),
-            updated_at: Date.now(),
-          };
-          taskMap.set(taskId, entry);
-          const createNote = entry.note ? ` — ${entry.note}` : "";
-          server.server.notification({
-            method: "notifications/claude/channel",
-            params: {
-              content: `[${taskId}] created [${entry.status}] ${entry.label}${createNote}`,
-              meta: { agent_id: agentId, event: "task_create", task_id: taskId, task: entry },
-            },
-          }).catch((err) => console.error("[deleg8] channel task_create notification failed:", err));
-          return { id, type: "host_tool_result", result: entry } as unknown as Frame;
-        }
-        if (tool === "task_update") {
-          const taskId = String(args.task_id ?? "");
-          const entry = taskMap.get(taskId);
-          if (!entry) {
-            return { id, type: "host_tool_result", isError: true, result: { error: `task ${taskId} not found` } } as unknown as Frame;
-          }
-          if (args.status !== undefined) entry.status = args.status as TaskEntry["status"];
-          if (args.note !== undefined) entry.note = String(args.note);
-          entry.updated_at = Date.now();
-          const updateNote = entry.note ? ` — ${entry.note}` : "";
-          server.server.notification({
-            method: "notifications/claude/channel",
-            params: {
-              content: `[${taskId}] [${entry.status}] ${entry.label}${updateNote}`,
-              meta: { agent_id: agentId, event: "task_update", task_id: taskId, task: entry },
-            },
-          }).catch((err) => console.error("[deleg8] channel task_update notification failed:", err));
-          return { id, type: "host_tool_result", result: entry } as unknown as Frame;
-        }
-
-        if (tool === "task_list") {
-          const filterAgent = typeof args.agent_id === "string" ? args.agent_id : undefined;
-          const tasks = [...taskMap.values()].filter((t) => !filterAgent || t.agent_id === filterAgent);
-          return { id, type: "host_tool_result", result: { count: tasks.length, tasks } } as unknown as Frame;
-        }
-
-        // ── Exclusive command lock tools ────────────────────────────
-        if (tool === "exclusive_acquire") {
-          const pattern = String(args.pattern ?? "");
-          if (!pattern) {
-            return { id, type: "host_tool_result", isError: true, result: { error: "exclusive_acquire requires a `pattern` argument" } } as unknown as Frame;
-          }
-          const acquired = registry.acquireExclusive(pattern, agentId);
-          server.server.notification({
-            method: "notifications/claude/channel",
-            params: {
-              content: acquired
-                ? `[deleg8 LOCK] ${agentId} acquired exclusive lock on /${pattern}/i`
-                : `[deleg8 LOCK WAIT] ${agentId} queued for exclusive lock on /${pattern}/i`,
-              meta: { agent_id: agentId, event: "exclusive_acquire", pattern, acquired },
-            },
-          }).catch((err: Error) => console.error("[deleg8] exclusive_acquire notification failed:", err));
-          return { id, type: "host_tool_result", result: { acquired } } as unknown as Frame;
-        }
-
-        if (tool === "exclusive_release") {
-          const pattern = String(args.pattern ?? "");
-          if (!pattern) {
-            return { id, type: "host_tool_result", isError: true, result: { error: "exclusive_release requires a `pattern` argument" } } as unknown as Frame;
-          }
-          const nextHolder = registry.releaseExclusive(pattern, agentId);
-          server.server.notification({
-            method: "notifications/claude/channel",
-            params: {
-              content: nextHolder
-                ? `[deleg8 LOCK] ${agentId} released exclusive lock on /${pattern}/i → transferred to ${nextHolder}`
-                : `[deleg8 LOCK] ${agentId} released exclusive lock on /${pattern}/i (no waiters)`,
-              meta: { agent_id: agentId, event: "exclusive_release", pattern, next_holder: nextHolder },
-            },
-          }).catch((err: Error) => console.error("[deleg8] exclusive_release notification failed:", err));
-          return { id, type: "host_tool_result", result: { released: true, next_holder: nextHolder } } as unknown as Frame;
-        }
-
-        return null; // unknown tool — fall through to default error response
-      };
 
       let response: unknown = null;
       if (args.initial_prompt) {
@@ -582,13 +618,14 @@ server.registerTool(
         if (re.test(args.message)) {
           const holder = registry.exclusiveLocks.get(entry.pattern);
           if (holder && holder !== args.agent_id) {
-            server.server.notification({
-              method: "notifications/claude/channel",
-              params: {
+            void notify(
+              "notifications/claude/channel",
+              {
                 content: `[deleg8 SEND] ${args.agent_id} sent a message matching exclusive pattern /${entry.pattern}/i but lock is held by ${holder}`,
                 meta: { agent_id: args.agent_id, event: "exclusive_contention", pattern: entry.pattern, holder },
               },
-            }).catch((err: Error) => console.error("[deleg8] exclusive contention notification failed:", err));
+              "exclusive contention",
+            );
           }
           break; // only warn on first match
         }
@@ -917,13 +954,14 @@ server.registerTool(
       taskMap.set(taskId, entry);
 
       // Fire notification so Claude Code UI updates/logs it
-      server.server.notification({
-        method: "notifications/claude/channel",
-        params: {
+      void notify(
+        "notifications/claude/channel",
+        {
           content: `[${taskId}] created [pending] ${entry.label}${entry.note ? ` — ${entry.note}` : ""}`,
           meta: { agent_id: args.agent_id, event: "task_create", task_id: taskId, task: entry },
         },
-      }).catch((err) => console.error("[deleg8] host task_create notification failed:", err));
+        "host task_create",
+      );
 
       return ok(entry);
     }),
@@ -958,13 +996,14 @@ server.registerTool(
         entry.updated_at = Date.now();
 
         // Fire notification
-        server.server.notification({
-          method: "notifications/claude/channel",
-          params: {
+        void notify(
+          "notifications/claude/channel",
+          {
             content: `[${args.task_id}] [${entry.status}] ${entry.label}${entry.note ? ` — ${entry.note}` : ""}`,
             meta: { agent_id: entry.agent_id, event: "task_update", task_id: args.task_id, task: entry },
           },
-        }).catch((err) => console.error("[deleg8] host task_update notification failed:", err));
+          "host task_update",
+        );
 
         return ok(entry);
       }),
@@ -993,6 +1032,7 @@ server.registerResource(
   }),
 );
 
+  return wireAgent;
 } // end registerTools
 
 // ── boot ────────────────────────────────────────────────────────────────
@@ -1039,7 +1079,8 @@ async function main(): Promise<void> {
   // tests use it to keep state inside a tempdir.
   const sessionLogDir =
     process.env.DELEG8_LOG_DIR ?? join(homedir(), ".claude", "deleg8", sessionId);
-  const { server, registry } = createPiAgentServer({
+  const deleg8Root = dirname(sessionLogDir);
+  const { server, registry, wireAgent } = createPiAgentServer({
     binary: process.env.OMP_BIN ?? "omp",
     logDir: sessionLogDir,
   });
@@ -1067,19 +1108,47 @@ async function main(): Promise<void> {
     }
   }
 
-  // Last-resort cleanup: when Claude Code dies (graceful or otherwise), kill every
-  // omp subprocess we spawned. Three independent triggers, any one of which fires:
-  //   1. SIGINT/SIGTERM from the OS (normal shutdown path)
-  //   2. MCP transport `close` / stdin EOF (parent closed our pipe)
-  //   3. ppid poller (parent reaped without closing stdin — rare, but possible
-  //      if a wrapper holds the pipe open across the parent's exit)
-  // The shutdown function is idempotent so racing triggers don't double-kill.
+  const adopted = registry.adoptPersisted(deleg8Root);
+  for (const agent of adopted) wireAgent(agent);
+  await drainEvents(deleg8Root, (event) =>
+    server.server.notification({ method: event.method, params: event.params }),
+  );
+
+  // Last-resort cleanup: suspend resumable agents and force-stop agents without
+  // an omp session. Three independent triggers can invoke this idempotent path:
+  // SIGINT/SIGTERM, transport close/stdin EOF, or parent reparenting.
   let shuttingDown = false;
   const shutdown = async (reason: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.error(`deleg8 shutting down (${reason}), stopping all agents…`);
-    await registry.stopAll({ force: true });
+    console.error(`deleg8 shutting down (${reason}), suspending resumable agents…`);
+    const suspended: PiAgent[] = [];
+    await Promise.allSettled(
+      registry.list().map(async (agent) => {
+        const status = agent.status();
+        if (status.state !== "running") return;
+        if (status.session_id !== null) {
+          await agent.suspend();
+          suspended.push(agent);
+        } else {
+          await agent.stop({ force: true });
+        }
+      }),
+    );
+    registry.persist();
+    for (const agent of suspended) {
+      try {
+        enqueueEvent(sessionLogDir, {
+          method: "notifications/claude/channel",
+          params: {
+            content: `agent ${agent.agentId} suspended at session end — resumable via send next session`,
+            meta: { agent_id: agent.agentId, event: "agent_suspended" },
+          },
+        });
+      } catch (error) {
+        console.error(`[deleg8] could not queue shutdown notification for ${agent.agentId}:`, error);
+      }
+    }
     process.exit(0);
   };
 

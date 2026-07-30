@@ -13,6 +13,7 @@ import { appendFileSync, mkdirSync, existsSync, statSync, renameSync } from "nod
 import { join } from "node:path";
 
 import { encode, readLines, decode, type Frame } from "./frames.ts";
+import type { AgentSnapshot } from "./persist.ts";
 
 export class PiAgentError extends Error {
   constructor(message: string) {
@@ -155,6 +156,8 @@ export interface PiAgentOptions {
   logPath?: string;
   /** Directory omp persists session state into (`--session-dir`). Defaults to `<logDir>/<agentId>-session`. */
   sessionDir?: string;
+  /** Snapshot from a previous server session; starts idle and resumes on first send. */
+  resumeState?: AgentSnapshot;
   /** If true, suspend the subprocess after every `turn_end` (default true). */
   autoSuspend?: boolean;
   /**
@@ -261,8 +264,7 @@ export class PiAgent {
 
   /**
    * Called for every turn_end and agent_end frame — used by channel push.
-   * Must be set by every code path that creates a PiAgent (currently only the spawn handler).
-   * Prefer threading this through RegistryOptions (like onUIRequest) once a second creation path exists.
+   * Must be set by every code path that creates a PiAgent.
    */
   onChannelFrame?: (agentId: string, frame: Frame, ftype: "turn_end" | "agent_end") => void;
 
@@ -279,22 +281,33 @@ export class PiAgent {
    */
   onViolation?: (agentId: string, type: "denied" | "scope", detail: Record<string, unknown>) => void;
 
+  /** Called when persisted lifecycle state changes. */
+  onStateChange?: (agent: PiAgent, event: "session" | "agent_end" | "suspend") => void;
+
   /** Capacity gate run before resume() respawns the subprocess. See PiAgentOptions.preResumeGate. */
   private readonly preResumeGate: (() => void) | undefined;
 
   constructor(agentId: string, opts: PiAgentOptions = {}) {
     this.agentId = agentId;
+    const resumed = opts.resumeState;
     this.binary = opts.binary ?? "omp";
-    this.extraArgs = opts.extraArgs ?? [];
-    this.cwd = opts.cwd;
+    this.extraArgs = opts.extraArgs ?? resumed?.extra_args ?? [];
+    this.cwd = opts.cwd ?? resumed?.cwd ?? undefined;
     this.env = opts.env;
-    this.rpcMode = opts.rpcMode ?? "rpc-ui";
+    this.rpcMode = opts.rpcMode ?? resumed?.rpc_mode ?? "rpc-ui";
     this.onUIRequest = opts.onUIRequest;
     this._optOnHostRequest = opts.onHostRequest;
     this.command = opts.command;
     this.logDir = opts.logDir ?? null;
-    this.logPath = opts.logPath ?? null;
-    this.sessionDir = opts.sessionDir ?? (this.logDir ? join(this.logDir, agentId, "omp") : null);
+    this.logPath = opts.logPath ?? resumed?.log_path ?? null;
+    this.sessionDir = opts.sessionDir ?? resumed?.session_dir ?? (this.logDir ? join(this.logDir, agentId, "omp") : null);
+    this.sessionId = resumed?.session_id ?? null;
+    this.sessionFile = resumed?.session_file ?? null;
+    this.startedAt = resumed?.started_at ?? 0;
+    this.lastActivity = resumed?.last_activity ?? 0;
+    this.messageCount = resumed?.message_count ?? 0;
+    this.model = resumed?.model ?? null;
+    this.state = resumed ? "idle" : "dead";
     this.autoSuspend = opts.autoSuspend ?? true;
     this.fallbackModel = opts.fallbackModel ?? null;
     this.preamble = opts.preamble ?? null;
@@ -405,8 +418,16 @@ export class PiAgent {
       if (typeof res === "string") return;
       const data = (res as { data?: unknown }).data ?? res;
       const obj = data as { sessionId?: unknown; sessionFile?: unknown };
-      if (typeof obj.sessionId === "string") this.sessionId = obj.sessionId;
-      if (typeof obj.sessionFile === "string") this.sessionFile = obj.sessionFile;
+      let changed = false;
+      if (typeof obj.sessionId === "string") {
+        this.sessionId = obj.sessionId;
+        changed = true;
+      }
+      if (typeof obj.sessionFile === "string") {
+        this.sessionFile = obj.sessionFile;
+        changed = true;
+      }
+      if (changed) this.notifyStateChange("session");
     } catch (e) {
       // get_state is fire-and-forget on startup. The agent may be stopped
       // before the response arrives — those rejections come from readLoop's
@@ -460,9 +481,9 @@ export class PiAgent {
    */
   async suspend(opts: { timeoutMs?: number } = {}): Promise<void> {
     if (this.state !== "running" || !this.proc) return;
-    if (!this.sessionId) return; // can't resume without sessionId — leave proc alive
+    if (this.sessionId === null) return; // can't resume without sessionId — leave proc alive
     this.state = "idle";
-    this.suspendTask = this.suspendProc(opts.timeoutMs);
+    this.suspendTask = this.suspendProc(opts.timeoutMs).finally(() => this.notifyStateChange("suspend"));
     await this.suspendTask;
   }
 
@@ -484,7 +505,7 @@ export class PiAgent {
 
   /** Respawn an idle agent against its prior session. No-op if already running. */
   async resume(): Promise<void> {
-    if (!this.sessionId) {
+    if (this.sessionId === null) {
       throw new PiAgentError(`agent ${this.agentId} has no sessionId — cannot resume`);
     }
     // Refuse before touching any state — the agent stays cleanly idle/resumable.
@@ -667,13 +688,17 @@ export class PiAgent {
       this.onChannelFrame?.(this.agentId, frame, ftype);
     }
 
-    if (ftype === "agent_end" && this.autoSuspend && this.state === "running" && this.sessionId && this.sessionDir) {
-      // agent_end fires once after omp's full agentic loop completes (all
-      // tool-call cycles done). turn_end fires after each individual cycle
-      // and is NOT a completion signal.
-      this.state = "idle";
-      this.suspendTask = this.suspendProc();
-      return;
+    if (ftype === "agent_end") {
+      if (this.autoSuspend && this.state === "running" && this.sessionId !== null && this.sessionDir !== null) {
+        // agent_end fires once after omp's full agentic loop completes (all
+        // tool-call cycles done). turn_end fires after each individual cycle
+        // and is NOT a completion signal.
+        this.state = "idle";
+        this.notifyStateChange("agent_end");
+        this.suspendTask = this.suspendProc().finally(() => this.notifyStateChange("suspend"));
+        return;
+      }
+      this.notifyStateChange("agent_end");
     }
 
     if (typeof fid === "string" && ftype === "response") {
@@ -817,6 +842,24 @@ export class PiAgent {
       scope_violations: this.scopeViolations.length,
     };
   }
+
+  snapshot(): AgentSnapshot {
+    const status = this.status();
+    return {
+      agent_id: this.agentId,
+      session_id: status.session_id,
+      session_file: status.session_file,
+      session_dir: status.session_dir,
+      log_path: status.log_path,
+      cwd: this.cwd ?? null,
+      extra_args: [...this.extraArgs],
+      rpc_mode: this.rpcMode,
+      model: status.model,
+      started_at: status.started_at,
+      last_activity: status.last_activity,
+      message_count: status.message_count,
+    };
+  }
   
   costUsd(): number {
     return this.totalCostUsd;
@@ -847,6 +890,13 @@ export class PiAgent {
     if (this.proc.exitCode !== null || this.proc.signalCode !== null) {
       const how = this.proc.exitCode !== null ? `code=${this.proc.exitCode}` : `signal=${this.proc.signalCode}`;
       throw new PiAgentError(`agent ${this.agentId} has exited (${how})`);
+    }
+  }
+  private notifyStateChange(event: "session" | "agent_end" | "suspend"): void {
+    try {
+      this.onStateChange?.(this, event);
+    } catch (error) {
+      console.error(`[deleg8] lifecycle callback failed for ${this.agentId}:`, error);
     }
   }
 }

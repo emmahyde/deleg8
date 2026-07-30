@@ -2,6 +2,8 @@
 
 import { PiAgent, PiAgentError } from "./agent.ts";
 import type { Frame } from "./frames.ts";
+import { basename, dirname, join } from "node:path";
+import { loadRegistrySnapshots, saveRegistry } from "./persist.ts";
 
 const ID_RE = /^[a-zA-Z0-9_.\-]{1,64}$/;
 let AUTO_ID = 0;
@@ -34,6 +36,8 @@ export interface RegistryOptions {
   onUIRequest?: (req: Frame) => Promise<Frame | null>;
   /** Directory each agent writes its `<agentId>.log` NDJSON into. Omit to disable logging. */
   logDir?: string;
+  /** Explicit registry state path. Defaults to `<logDir>/registry.json`. */
+  statePath?: string;
   /**
    * Auto-reap idle agents after N ms of inactivity after their last agent_end.
    * Default 1h; 0 = no auto-reap.
@@ -93,6 +97,7 @@ export class AgentRegistry {
   private readonly minFreeMemPct: number;
   private readonly readFreeMemPct: () => number | null;
   private readonly spawnCommand: string[] | undefined;
+  private readonly statePath: string | undefined;
   /** Spawns past assertCapacity but not yet registered — counted against the cap. */
   private inFlightStarts = 0;
   private readonly onReap: ((agentId: string, state: "idle" | "dead") => void) | undefined;
@@ -112,6 +117,7 @@ export class AgentRegistry {
     this.binary = opts.binary ?? "omp";
     this.onUIRequest = opts.onUIRequest;
     this.logDir = opts.logDir;
+    this.statePath = opts.statePath ?? (this.logDir ? join(this.logDir, "registry.json") : undefined);
     this.idleTTL = opts.idleTTL ?? DEFAULT_TTL_MS;
     this.deadTTL = opts.deadTTL ?? DEFAULT_TTL_MS;
     this.maxAgents = opts.maxAgents ?? DEFAULT_MAX_AGENTS;
@@ -145,6 +151,22 @@ export class AgentRegistry {
   /** Current TTL settings (ms). */
   get ttls(): { idle: number; dead: number } {
     return { idle: this.idleTTL, dead: this.deadTTL };
+  }
+
+  getLogDir(): string | undefined {
+    return this.logDir;
+  }
+
+  persist(): void {
+    if (!this.statePath) return;
+    try {
+      saveRegistry(this.statePath, {
+        session: basename(this.logDir ?? dirname(this.statePath)),
+        agents: this.list().map((agent) => agent.snapshot()),
+      });
+    } catch (error) {
+      console.error(`[deleg8] registry persistence failed at ${this.statePath}:`, error);
+    }
   }
 
   /** Agents whose subprocess is live (state "running"). */
@@ -271,6 +293,7 @@ export class AgentRegistry {
         );
       }
       this.agents.delete(aid);
+      this.persist();
     }
     this.assertCapacity(`spawn ${aid}`);
     const agent = new PiAgent(aid, {
@@ -284,10 +307,12 @@ export class AgentRegistry {
       // Resume respawns the subprocess, so it counts against the same cap.
       preResumeGate: () => this.assertCapacity(`resume ${aid}`),
     });
+    agent.onStateChange = () => this.persist();
     this.inFlightStarts += 1;
     try {
       await agent.start();
       this.agents.set(aid, agent);
+      this.persist();
     } finally {
       this.inFlightStarts -= 1;
     }
@@ -306,16 +331,38 @@ export class AgentRegistry {
     return Array.from(this.agents.values());
   }
 
+  adoptPersisted(root: string): PiAgent[] {
+    const adopted: PiAgent[] = [];
+    for (const snapshot of loadRegistrySnapshots(root)) {
+      if (!ID_RE.test(snapshot.agent_id) || this.agents.has(snapshot.agent_id)) continue;
+      const agent = new PiAgent(snapshot.agent_id, {
+        binary: this.binary,
+        command: this.spawnCommand,
+        onUIRequest: this.onUIRequest,
+        logDir: this.logDir,
+        resumeState: snapshot,
+        preResumeGate: () => this.assertCapacity(`resume ${snapshot.agent_id}`),
+      });
+      agent.onStateChange = () => this.persist();
+      this.agents.set(snapshot.agent_id, agent);
+      adopted.push(agent);
+    }
+    if (adopted.length > 0) this.persist();
+    return adopted;
+  }
+
   async stop(agentId: string, opts: { force?: boolean } = {}): Promise<number | null> {
     const agent = this.get(agentId);
     const code = await agent.stop({ force: opts.force });
     this.releaseAgentLocks(agentId);
+    this.persist();
     return code;
   }
 
   remove(agentId: string): void {
     this.agents.delete(agentId);
     this.releaseAgentLocks(agentId);
+    this.persist();
   }
 
   /** Remove every agent matching one of the given states. Returns removed ids. */
@@ -328,6 +375,7 @@ export class AgentRegistry {
         removed.push(id);
       }
     }
+    if (removed.length > 0) this.persist();
     return removed;
   }
 
@@ -335,6 +383,7 @@ export class AgentRegistry {
     await Promise.allSettled(this.list().map((a) => a.stop({ force: opts.force })));
     this.exclusiveLocks.clear();
     this.exclusiveQueue.clear();
+    this.persist();
   }
 
   // ── auto-reap ─────────────────────────────────────────────────────────
@@ -353,6 +402,7 @@ export class AgentRegistry {
 
   private tickReap(): void {
     const now = Date.now();
+    let removed = false;
     for (const [id, agent] of this.agents) {
       const s = agent.status();
       const sinceLast = now - s.last_activity;
@@ -360,12 +410,15 @@ export class AgentRegistry {
         this.agents.delete(id);
         this.releaseAgentLocks(id);
         this.onReap?.(id, "idle");
+        removed = true;
       } else if (s.state === "dead" && this.deadTTL > 0 && sinceLast > this.deadTTL) {
         this.agents.delete(id);
         this.releaseAgentLocks(id);
         this.onReap?.(id, "dead");
+        removed = true;
       }
     }
+    if (removed) this.persist();
   }
 
   private autoId(): string {
