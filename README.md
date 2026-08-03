@@ -29,7 +29,7 @@ cc --plugin-dir .
 
 - **Bun** ≥ 1.1.0 (`brew install bun` or `curl -fsSL https://bun.sh/install | bash`)
 - **omp** on PATH (or set `OMP_BIN` in settings)
-- Dependencies installed: `cd pi-agent-mcp && bun install`
+- Dependencies installed: `bun install`
 
 ## Configuration
 

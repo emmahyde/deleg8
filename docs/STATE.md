@@ -10,8 +10,8 @@ Never soft-wrap markdown; never manually unwrap it by hand — a mechanical hook
 ## Decisions
 DECISION: deleg8 ok() responses drop structuredContent duplicate, compact JSON in content[0].text; AgentStatus no longer echoes preamble (from prior task 2026-07-25, still standing). DECISION: cap counts running + in-flight-starting agents, not idle — idle agents hold no process (agent.ts autoSuspend=true kills proc on agent_end; verified agent.ts:289,451-473). DECISION: resume() also gated (respawns a process) via preResumeGate callback injected by registry. DECISION: defaults maxAgents=6, minFreeMemPct=15, idleTTL=deadTTL=1h; env-overridable; 0/absent disables each gate. DECISION: memory gate fails open (command missing/unparseable → allow spawn, log) — safety net, not a hard macOS dependency.
 ## Facts
-- repo: /Users/emmahyde/projects/deleg8/pi-agent-mcp (its own .git; parent deleg8/ is NOT a repo)
-- test command: cd pi-agent-mcp && bun test; typecheck: bunx tsc --noEmit
+- repo: /Users/emmahyde/projects/deleg8 (pi-agent-mcp's git history merged into deleg8 root 2026-08-03; pi-agent-mcp/ subdirectory removed)
+- test command: bun test; typecheck: bunx tsc --noEmit
 - BASELINE (this task): 55 pass, 0 fail (7 files)
 - registry spawn: src/registry.ts:172-199; spawn handler: src/server.ts:325-342; TTL defaults: server.ts:328-329
 - panic evidence: /Library/Logs/DiagnosticReports/panic-full-2026-07-25-134236.0002.panic (100% compressor segments, 21 swapfiles); session ~/.claude/deleg8/eda23202 had ~15 concurrent gum-*-port agents until 13:38
