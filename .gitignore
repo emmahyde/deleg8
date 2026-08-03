@@ -1,0 +1,9 @@
+# Ignore local settings files
+.claude/*.local.md
+
+node_modules/
+dist/
+bun.lockb
+*.log
+.DS_Store
+banks/

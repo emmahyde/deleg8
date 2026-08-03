@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "deleg8": {
+      "command": "bun",
+      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/pi-agent-mcp/src/server.ts"],
+      "env": {
+        "OMP_BIN": "${OMP_BIN-omp}"
+      }
+    }
+  }
+}

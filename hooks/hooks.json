@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You are a deleg8 enforcement guard. The orchestrator just called the `Agent` tool to spawn a subagent.\n\nTool input:\n$ARGUMENTS\n\nRules:\n1. If `agent` is \"explore\" → ALLOW (read-only exploration is fine).\n2. If every task in `tasks[]` has a specific, descriptive `role` (not empty, not \"task\", not \"quick_task\") → ALLOW.\n3. Otherwise → BLOCK. This is a bare/generic Agent spawn. Return: {\"block\": true, \"reason\": \"Bare Agent() is banned. Use deleg8: spawn(agent_id='descriptive-name', initial_prompt='...')\"}\n\nRespond with JSON only: {\"block\": true, \"reason\": \"...\"} or {\"block\": false}."
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__deleg8__spawn|mcp__deleg8__set_model",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/deny-anthropic-models.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
