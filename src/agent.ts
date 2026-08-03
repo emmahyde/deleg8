@@ -15,6 +15,20 @@ import { join } from "node:path";
 import { encode, readLines, decode, type Frame } from "./frames.ts";
 import type { AgentSnapshot } from "./persist.ts";
 
+/**
+ * A tool deleg8 implements on omp's behalf. Mirrors omp's `RpcHostToolDefinition`
+ * (dist/types/modes/rpc/rpc-types.d.ts:650) — omp is a runtime peer, not a build
+ * dependency, so the shape is restated rather than imported.
+ */
+export interface RpcHostToolDefinition {
+  name: string;
+  label?: string;
+  description: string;
+  /** JSON Schema object describing the tool's arguments. */
+  parameters: Record<string, unknown>;
+  hidden?: boolean;
+}
+
 export class PiAgentError extends Error {
   constructor(message: string) {
     super(message);
@@ -221,6 +235,12 @@ export class PiAgent {
   private readyResolve: (() => void) | null = null;
   private readyReject: ((err: Error) => void) | null = null;
   private state: AgentState = "dead";
+  /**
+   * Set by stop(). An operator-issued stop is terminal even when a resumable
+   * sessionId exists — without this the agent is indistinguishable from an
+   * auto-suspended one and prune(["dead"]) skips it forever.
+   */
+  private stopped = false;
   private suspendTask: Promise<void> | null = null;
   private readonly pending = new Map<string, Pending>();
   private readonly buffer: BufferedFrame[] = [];
@@ -283,6 +303,14 @@ export class PiAgent {
 
   /** Called when persisted lifecycle state changes. */
   onStateChange?: (agent: PiAgent, event: "session" | "agent_end" | "suspend") => void;
+
+  /**
+   * Host tools advertised to omp via `set_host_tools`. omp's tool registry is
+   * per-process, so this is re-sent on every start() — including the respawn
+   * inside resume(). Empty means the agent sees no host tools at all, which was
+   * deleg8's behavior before 2026-07-31 despite the docs claiming otherwise.
+   */
+  hostTools: RpcHostToolDefinition[] = [];
 
   /** Capacity gate run before resume() respawns the subprocess. See PiAgentOptions.preResumeGate. */
   private readonly preResumeGate: (() => void) | undefined;
@@ -368,6 +396,7 @@ export class PiAgent {
     this.startedAt = Date.now();
     this.lastActivity = this.startedAt;
     this.state = "running";
+    this.stopped = false; // a restart un-does a prior stop
     this.writeChain = Promise.resolve();
     if (!this.logPath && this.logDir) {
       try {
@@ -395,7 +424,7 @@ export class PiAgent {
           this.readyResolve = null;
         }
         if (this.state !== "idle") {
-          this.state = this.sessionId ? "idle" : "dead";
+          this.state = this.sessionId && !this.stopped ? "idle" : "dead";
         }
       });
     });
@@ -410,6 +439,10 @@ export class PiAgent {
     // Fire-and-forget here; if it fails (e.g. older omp without get_state),
     // the agent still works, we just won't have a sessionId for resume.
     void this.captureSession();
+
+    // Awaited, unlike captureSession: the tools must exist in omp's registry
+    // before the first prompt, or the model's first turn can't see them.
+    await this.registerHostTools();
   }
 
   private async captureSession(): Promise<void> {
@@ -444,6 +477,8 @@ export class PiAgent {
   }
 
   async stop(opts: { force?: boolean; timeoutMs?: number } = {}): Promise<number | null> {
+    this.stopped = true;
+    this.state = "dead";
     const proc = this.proc;
     if (proc === null) return null;
     const timeoutMs = opts.timeoutMs ?? 5000;
@@ -538,6 +573,35 @@ export class PiAgent {
 
   async abort(): Promise<void> {
     await this.dispatch({ id: this.nextId(), type: "abort" }, { wait: false });
+  }
+
+  /**
+   * Advertise `hostTools` to omp so the model can actually call them. Without
+   * this the agent has no `msg`/`task_create`/... tool and any attempt to use
+   * one is a hallucination. Returns the names omp accepted.
+   *
+   * Tolerant by design: an omp too old to know `set_host_tools` answers with an
+   * error response, which costs the agent its host tools but must not abort the
+   * spawn — every other capability still works.
+   */
+  async registerHostTools(): Promise<string[]> {
+    if (this.hostTools.length === 0) return [];
+    try {
+      const res = await this.sendRaw(
+        { id: this.nextId(), type: "set_host_tools", tools: this.hostTools },
+        { wait: true, timeoutMs: 10_000 },
+      );
+      if (typeof res === "string") return [];
+      if ((res as { success?: unknown }).success === false) {
+        console.error(`deleg8: set_host_tools rejected for ${this.agentId}:`, (res as { error?: unknown }).error);
+        return [];
+      }
+      const data = (res as { data?: { toolNames?: unknown } }).data;
+      return Array.isArray(data?.toolNames) ? (data.toolNames as string[]) : [];
+    } catch (e) {
+      console.error(`deleg8: set_host_tools failed for ${this.agentId}:`, (e as Error).message);
+      return [];
+    }
   }
 
   async sendRaw(frame: Frame, opts: { wait?: boolean; timeoutMs?: number } = {}): Promise<Frame | string> {
@@ -779,11 +843,17 @@ export class PiAgent {
     }
     // Default: refuse so omp doesn't hang. Shape depends on the request type.
     if (request.type === "host_tool_call") {
+      const toolName = typeof request.toolName === "string" ? request.toolName : "?";
       await this.safeWrite({
         type: "host_tool_result",
         id,
         isError: true,
-        result: { error: "deleg8 registered no host tools" },
+        // AgentToolResult requires an array `content`; a bare error object is
+        // rejected by omp and the tool call hangs instead of failing.
+        result: {
+          content: [{ type: "text", text: `deleg8 has no handler for host tool "${toolName}"` }],
+          details: {},
+        },
       });
     } else if (request.type === "host_uri_request") {
       await this.safeWrite({
@@ -820,7 +890,7 @@ export class PiAgent {
     const procAlive = proc !== null && proc.exitCode === null && proc.signalCode === null;
     if (!procAlive && this.state === "running") {
       // Process died unexpectedly. If we have a sessionId, we can still resume → idle.
-      this.state = this.sessionId ? "idle" : "dead";
+      this.state = this.sessionId && !this.stopped ? "idle" : "dead";
     }
     return {
       agent_id: this.agentId,

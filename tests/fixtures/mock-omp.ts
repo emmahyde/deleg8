@@ -5,6 +5,8 @@
 //   ready (emitted on boot, no id)
 //   prompt          -> response with data, then turn_end + agent_end
 //   set_model       -> silently acknowledged
+//   set_host_tools  -> response with data {toolNames}
+//   host_tool_result -> pairs back to the originating prompt
 //   abort           -> process.exit(0)
 //   get_state       -> response with {sessionId, sessionFile}
 //   extension_ui_response -> pairs back to the originating prompt
@@ -19,6 +21,8 @@
 //   "ASK:input"          emit an input UI request, then respond with {user_input}
 //   "NOTIFY ..."         emit a passive notify frame, then respond with {echo}
 //   "COUNT"              respond with {turn_count} reflecting persisted history
+//   "CALL:<tool>:<json>" issue a host_tool_call, then respond with the host's result
+//   "TOOLS"              respond with {host_tools} — the names registered so far
 //   anything else        respond with {echo: message}
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
@@ -86,6 +90,12 @@ write({ type: "ready" });
 const pendingUI = new Map<string, { promptId: string; key: string; userMessage: string }>();
 let uiCounter = 0;
 
+// Host tools the wrapper registered via set_host_tools, keyed by name. Real omp
+// keeps this per-process, so a respawn must re-register — tests assert that.
+const hostTools = new Map<string, Frame>();
+const pendingHostCalls = new Map<string, { promptId: string; userMessage: string }>();
+let hostCallCounter = 0;
+
 function startUi(promptId: string, method: string, key: string, userMessage: string, extra: Frame): string {
   const uiId = `ui-${++uiCounter}`;
   pendingUI.set(uiId, { promptId, key, userMessage });
@@ -137,6 +147,29 @@ for await (const line of readLines(Bun.stdin.stream())) {
       finishTurn(id, message, { echo: message });
     } else if (message === "COUNT") {
       finishTurn(id, message, { turn_count: turnCount + 1 });
+    } else if (message === "TOOLS") {
+      finishTurn(id, message, { host_tools: [...hostTools.keys()] });
+    } else if (message.startsWith("CALL:")) {
+      // "CALL:<tool>:<json args>" — the colon-delimited tail is the JSON, which
+      // may itself contain colons, so split only on the first two.
+      const rest = message.slice("CALL:".length);
+      const sep = rest.indexOf(":");
+      const toolName = sep < 0 ? rest : rest.slice(0, sep);
+      const rawArgs = sep < 0 ? "{}" : rest.slice(sep + 1);
+      let parsedArgs: Frame;
+      try {
+        parsedArgs = JSON.parse(rawArgs) as Frame;
+      } catch {
+        finishTurn(id, message, { error: `bad args JSON: ${rawArgs}` });
+        continue;
+      }
+      if (!hostTools.has(toolName)) {
+        finishTurn(id, message, { error: `unregistered host tool: ${toolName}` });
+        continue;
+      }
+      const callId = `htc-${++hostCallCounter}`;
+      pendingHostCalls.set(callId, { promptId: id, userMessage: message });
+      write({ type: "host_tool_call", id: callId, toolName, arguments: parsedArgs });
     } else {
       finishTurn(id, message, { echo: message });
     }
@@ -154,6 +187,28 @@ for await (const line of readLines(Bun.stdin.stream())) {
       value = typeof frame.value === "string" ? frame.value : "";
     }
     finishTurn(pending.promptId, pending.userMessage, { [pending.key]: value });
+  } else if (ftype === "set_host_tools") {
+    // Real omp replaces the whole registry rather than merging.
+    hostTools.clear();
+    const tools = Array.isArray(frame.tools) ? (frame.tools as Frame[]) : [];
+    for (const t of tools) {
+      if (typeof t?.name === "string") hostTools.set(t.name, t);
+    }
+    write({
+      type: "response",
+      id,
+      command: "set_host_tools",
+      success: true,
+      data: { toolNames: [...hostTools.keys()] },
+    });
+  } else if (ftype === "host_tool_result") {
+    const pending = pendingHostCalls.get(id);
+    if (!pending) continue;
+    pendingHostCalls.delete(id);
+    finishTurn(pending.promptId, pending.userMessage, {
+      tool_result: frame.result,
+      tool_is_error: Boolean(frame.isError),
+    });
   } else if (ftype === "set_model") {
     // No-op acknowledgement — wrapper sends these fire-and-forget.
   } else if (ftype === "abort") {

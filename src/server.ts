@@ -4,14 +4,14 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { PiAgentError, type PiAgent } from "./agent.ts";
+import { PiAgentError, type PiAgent, type RpcHostToolDefinition } from "./agent.ts";
 import type { Frame } from "./frames.ts";
 import { jqFilter } from "./jq-filter.ts";
 import { AgentRegistry } from "./registry.ts";
@@ -41,6 +41,35 @@ function envNonNegInt(name: string): number | undefined {
   return Number.isInteger(n) && n >= 0 ? n : undefined;
 }
 
+/**
+ * Identity of the code this process is actually running.
+ *
+ * deleg8 servers are long-lived and Bun does not hot-reload, so a server can be
+ * many commits behind the checkout while looking healthy — on 2026-07-31 a
+ * server from Jul 30 01:24 was still missing two same-day deliverability fixes
+ * and nothing in its output said so. Resolved once, at module load.
+ */
+const BUILD_STAMP: { commit: string; source_mtime: string; started_at: string } = (() => {
+  const srcDir = dirname(new URL(import.meta.url).pathname);
+  let commit = "unknown";
+  try {
+    const head = readFileSync(join(srcDir, "..", ".git", "HEAD"), "utf8").trim();
+    const ref = head.startsWith("ref: ") ? head.slice(5) : null;
+    commit = ref
+      ? readFileSync(join(srcDir, "..", ".git", ref), "utf8").trim().slice(0, 12)
+      : head.slice(0, 12);
+  } catch {
+    // Not a git checkout (installed copy, or .git pruned) — the mtime still dates it.
+  }
+  let sourceMtime = "unknown";
+  try {
+    sourceMtime = statSync(join(srcDir, "server.ts")).mtime.toISOString();
+  } catch {
+    /* source read from a bundle */
+  }
+  return { commit, source_mtime: sourceMtime, started_at: new Date().toISOString() };
+})();
+
 export interface PiAgentServerHandle {
   server: McpServer;
   registry: AgentRegistry;
@@ -57,8 +86,8 @@ export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentSer
       instructions: [
         "Agent completion arrives as <channel source=\"deleg8\" agent_id=\"X\" event=\"agent_end\"> with the agent's final message — intermediate turn frames are suppressed.",
         "Agents can send mid-task IRC messages: <channel source=\"deleg8\" agent_id=\"X\" event=\"msg\">.",
-        "To send a direct message from inside a prompt, have the agent call host_tool_call with tool=\"msg\" and args={text:\"...\"}.",
-        "Agents track sub-work via host_tool_call: tool=\"task_create\" args={label,note?} and tool=\"task_update\" args={task_id,status,note?} — each emits a <channel event=\"task_create\"> or <channel event=\"task_update\"> notification in real time.",
+        "Spawned agents get these deleg8-provided tools in their own tool list: msg{text}, task_create{label,note?}, task_update{task_id,status,note?}, task_list{agent_id?}, exclusive_acquire{pattern}, exclusive_release{pattern}. Tell the agent to call them by name in its prompt.",
+        "task_create and task_update each emit a <channel event=\"task_create\"> or <channel event=\"task_update\"> notification in real time.",
         "Use the tasks tool to query the full task registry. Use the send tool to resume an idle agent.",
       ].join(" "),
     },
@@ -99,6 +128,9 @@ const MAX_TASKS_PER_AGENT = 100;
 const MAX_TASK_LABEL_BYTES = 200;
 /** Maximum note length for a task. */
 const MAX_TASK_NOTE_BYTES = 1000;
+
+/** Maximum length of an agent's mid-task `msg`. Longer belongs in the final report. */
+const MAX_MSG_BYTES = 2000;
 
 /**
  * Remove all tasks belonging to the given agent_id from the task map.
@@ -276,16 +308,122 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
     label: string,
   ): Promise<void> => sendNotification(server, sessionLogDir, method, params, label);
 
+  /**
+   * Tools deleg8 implements on the agent's behalf, advertised to omp at start().
+   * Every name here must have a branch in handleHostRequest below, and vice
+   * versa — a mismatch is silent: omp offers a tool whose call falls through to
+   * "not registered", or deleg8 handles a tool the model never sees.
+   */
+  const HOST_TOOLS: RpcHostToolDefinition[] = [
+    {
+      name: "msg",
+      label: "Message orchestrator",
+      description:
+        "Send a short progress message to the orchestrator mid-task, without ending your turn. " +
+        "Use for findings worth surfacing before your final report.",
+      parameters: {
+        type: "object",
+        properties: { text: { type: "string", description: "The message. One or two sentences." } },
+        required: ["text"],
+      },
+    },
+    {
+      name: "task_create",
+      label: "Create task",
+      description: "Register a unit of sub-work so the orchestrator can see it. Returns the task_id to pass to task_update.",
+      parameters: {
+        type: "object",
+        properties: {
+          label: { type: "string", description: "Short imperative description of the work." },
+          note: { type: "string", description: "Optional detail, e.g. acceptance check." },
+        },
+        required: ["label"],
+      },
+    },
+    {
+      name: "task_update",
+      label: "Update task",
+      description: "Move a task you created to a new status.",
+      parameters: {
+        type: "object",
+        properties: {
+          task_id: { type: "string", description: "id returned by task_create." },
+          status: { type: "string", enum: ["pending", "in_progress", "completed", "failed"] },
+          note: { type: "string", description: "Optional detail, e.g. the finding." },
+        },
+        required: ["task_id", "status"],
+      },
+    },
+    {
+      name: "task_list",
+      label: "List tasks",
+      description: "List tracked tasks, optionally filtered to one agent.",
+      parameters: {
+        type: "object",
+        properties: { agent_id: { type: "string", description: "Filter to this agent. Omit for all." } },
+      },
+    },
+    {
+      name: "exclusive_acquire",
+      label: "Acquire exclusive lock",
+      description:
+        "Acquire the cooperative lock for a command pattern before running it. Blocks until granted. " +
+        "Required only for patterns the orchestrator declared exclusive at spawn.",
+      parameters: {
+        type: "object",
+        properties: { pattern: { type: "string", description: "The declared exclusive pattern." } },
+        required: ["pattern"],
+      },
+    },
+    {
+      name: "exclusive_release",
+      label: "Release exclusive lock",
+      description: "Release a lock acquired with exclusive_acquire. Always release, even on failure.",
+      parameters: {
+        type: "object",
+        properties: { pattern: { type: "string", description: "The pattern to release." } },
+        required: ["pattern"],
+      },
+    },
+  ];
+
+  /**
+   * Build a `host_tool_result` frame. omp validates `result.content` is an array
+   * (rpc-types.d.ts:679, AgentToolResult) — a bare payload object is rejected,
+   * so the JSON payload rides in a text block and stays machine-readable.
+   */
+  const hostResult = (id: string, payload: unknown, isError = false): Frame =>
+    ({
+      type: "host_tool_result",
+      id,
+      result: { content: [{ type: "text", text: JSON.stringify(payload) }], details: {} },
+      ...(isError ? { isError: true } : {}),
+    }) as unknown as Frame;
+
   const handleHostRequest = async (agentId: string, request: Frame): Promise<Frame | null> => {
     const req = request as Record<string, unknown>;
-    const tool = typeof req.tool === "string" ? req.tool : "";
-    const args = (req.args ?? {}) as Record<string, unknown>;
+    // omp sends `toolName`/`arguments` (RpcHostToolCallRequest, rpc-types.d.ts:660).
+    // `tool`/`args` are deleg8's own pre-2026-07-31 names, kept as a fallback so
+    // an older omp — or the mock — still resolves.
+    const tool = typeof req.toolName === "string" ? req.toolName : typeof req.tool === "string" ? req.tool : "";
+    const args = (req.arguments ?? req.args ?? {}) as Record<string, unknown>;
     const id = typeof req.id === "string" ? req.id : "";
+
+    if (tool === "msg") {
+      const text = String(args.text ?? "").slice(0, MAX_MSG_BYTES);
+      if (!text) return hostResult(id, { error: "msg requires a `text` argument" }, true);
+      void notify(
+        "notifications/claude/channel",
+        { content: text, meta: { agent_id: agentId, event: "msg" } },
+        "channel msg",
+      );
+      return hostResult(id, { delivered: true });
+    }
 
     if (tool === "task_create") {
       const agentTaskCount = [...taskMap.values()].filter((t) => t.agent_id === agentId).length;
       if (agentTaskCount >= MAX_TASKS_PER_AGENT) {
-        return { id, type: "host_tool_result", isError: true, result: { error: `task limit reached (${MAX_TASKS_PER_AGENT} per agent)` } } as unknown as Frame;
+        return hostResult(id, { error: `task limit reached (${MAX_TASKS_PER_AGENT} per agent)` }, true);
       }
       taskSeq += 1;
       const taskId = `task-${taskSeq}`;
@@ -308,13 +446,13 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
         },
         "channel task_create",
       );
-      return { id, type: "host_tool_result", result: entry } as unknown as Frame;
+      return hostResult(id, entry);
     }
     if (tool === "task_update") {
       const taskId = String(args.task_id ?? "");
       const entry = taskMap.get(taskId);
       if (!entry) {
-        return { id, type: "host_tool_result", isError: true, result: { error: `task ${taskId} not found` } } as unknown as Frame;
+        return hostResult(id, { error: `task ${taskId} not found` }, true);
       }
       if (args.status !== undefined) entry.status = args.status as TaskEntry["status"];
       if (args.note !== undefined) entry.note = String(args.note);
@@ -328,19 +466,19 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
         },
         "channel task_update",
       );
-      return { id, type: "host_tool_result", result: entry } as unknown as Frame;
+      return hostResult(id, entry);
     }
 
     if (tool === "task_list") {
       const filterAgent = typeof args.agent_id === "string" ? args.agent_id : undefined;
       const tasks = [...taskMap.values()].filter((t) => !filterAgent || t.agent_id === filterAgent);
-      return { id, type: "host_tool_result", result: { count: tasks.length, tasks } } as unknown as Frame;
+      return hostResult(id, { count: tasks.length, tasks });
     }
 
     if (tool === "exclusive_acquire") {
       const pattern = String(args.pattern ?? "");
       if (!pattern) {
-        return { id, type: "host_tool_result", isError: true, result: { error: "exclusive_acquire requires a `pattern` argument" } } as unknown as Frame;
+        return hostResult(id, { error: "exclusive_acquire requires a `pattern` argument" }, true);
       }
       const acquired = registry.acquireExclusive(pattern, agentId);
       void notify(
@@ -353,13 +491,13 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
         },
         "exclusive_acquire",
       );
-      return { id, type: "host_tool_result", result: { acquired } } as unknown as Frame;
+      return hostResult(id, { acquired });
     }
 
     if (tool === "exclusive_release") {
       const pattern = String(args.pattern ?? "");
       if (!pattern) {
-        return { id, type: "host_tool_result", isError: true, result: { error: "exclusive_release requires a `pattern` argument" } } as unknown as Frame;
+        return hostResult(id, { error: "exclusive_release requires a `pattern` argument" }, true);
       }
       const nextHolder = registry.releaseExclusive(pattern, agentId);
       void notify(
@@ -372,7 +510,7 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
         },
         "exclusive_release",
       );
-      return { id, type: "host_tool_result", result: { released: true, next_holder: nextHolder } } as unknown as Frame;
+      return hostResult(id, { released: true, next_holder: nextHolder });
     }
 
     return null;
@@ -407,6 +545,10 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
       );
     };
     agent.onHostRequest = handleHostRequest;
+    // Read by start(), so every later respawn (resume, fallback model) re-registers.
+    // The initial start() already happened inside registry.spawn(), which is why the
+    // spawn handler registers once explicitly right after this call.
+    agent.hostTools = HOST_TOOLS;
   };
 
 // ── spawn ────────────────────────────────────────────────────────────
@@ -569,7 +711,7 @@ server.registerTool(
       agent.preamble = args.preamble ?? null;
       agent.fallbackModel = args.fallback_model ?? null;
       wireAgent(agent);
-
+      await agent.registerHostTools();
 
       // Configure model
       async function applyModel(model: { provider: string; modelId: string }): Promise<boolean> {
@@ -705,6 +847,8 @@ server.registerTool(
       "`idle` means the subprocess has exited at end-of-turn but the omp " +
       "session is on disk and resumable via send. `dead` means the agent crashed or was " +
       "stopped — registry entry persists for inspection until prune. Mirrors TaskList. " +
+      "`server` carries the running process's commit/source mtime/boot time: compare it against " +
+      "the checkout to tell whether this server predates a fix you expect it to have. " +
       "Pass `jq` to project (e.g. `.agents | map({id: .agent_id, state})`).",
     inputSchema: {
       jq: z.string().optional().describe("Optional jq -c filter applied to the structured result."),
@@ -720,7 +864,7 @@ server.registerTool(
   async (args) =>
     guard(async () => {
       const agents = registry.list().map((a) => ({ ...a.status(), total_cost_usd: a.costUsd() }));
-      const result = await project({ count: agents.length, agents }, args.jq);
+      const result = await project({ count: agents.length, agents, server: BUILD_STAMP }, args.jq);
       return ok(result);
     }),
 );
@@ -1130,7 +1274,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   // NOTE: never write to stdout from here — it corrupts the JSON-RPC stream.
   console.error(
-    `deleg8 ready (binary=${process.env.OMP_BIN ?? "omp"}, session=${sessionId}, logs=${sessionLogDir})`,
+    `deleg8 ready (commit=${BUILD_STAMP.commit}, binary=${process.env.OMP_BIN ?? "omp"}, session=${sessionId}, logs=${sessionLogDir})`,
   );
 
   // Log rotation: reap stale sibling session dirs (4.1G accumulated in two
