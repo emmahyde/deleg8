@@ -1,0 +1,19 @@
+{
+  "name": "deleg8",
+  "owner": {
+    "name": "Emma Hyde"
+  },
+  "plugins": [
+    {
+      "name": "deleg8",
+      "source": "./",
+      "description": "Persistent oh-my-pi (omp) subagents via MCP. Makes deleg8 the default delegation mechanism — spawns named, resumable subagents instead of bare one-shot task() calls.",
+      "version": "0.2.1",
+      "author": {
+        "name": "Emma Hyde"
+      },
+      "license": "MIT",
+      "keywords": ["subagents", "delegation", "parallel", "omp", "oh-my-pi", "fan-out"]
+    }
+  ]
+}

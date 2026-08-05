@@ -1,6 +1,6 @@
 {
   "name": "deleg8",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server that wraps oh-my-pi (`omp --mode rpc`) as named, persistent subagents addressable from Claude Code.",
   "type": "module",
   "bin": {

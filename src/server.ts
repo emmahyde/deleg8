@@ -12,6 +12,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { PiAgentError, type PiAgent, type RpcHostToolDefinition } from "./agent.ts";
+import { loadDeleg8Config, type ModelSpec } from "./config.ts";
 import type { Frame } from "./frames.ts";
 import { jqFilter } from "./jq-filter.ts";
 import { AgentRegistry } from "./registry.ts";
@@ -77,6 +78,10 @@ export interface PiAgentServerHandle {
 }
 
 export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentServerHandle {
+  // Project .claude/deleg8.local.md takes precedence over ~/.claude/deleg8.local.md;
+  // see config.ts. Loaded once at server startup, not per spawn — deleg8.local.md
+  // configures deleg8 itself, not any individual agent's own working directory.
+  const config = loadDeleg8Config();
   const server = new McpServer(
     { name: "deleg8", version: "0.1.0" },
     {
@@ -100,13 +105,13 @@ export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentSer
   const registry =
     opts.registry ??
     new AgentRegistry({
-      binary: opts.binary ?? process.env.OMP_BIN ?? "omp",
+      binary: opts.binary ?? process.env.OMP_BIN ?? config.ompBin ?? "omp",
       onUIRequest: makeElicitBridge(server),
       logDir: sessionLogDir,
       maxAgents: opts.maxAgents ?? envNonNegInt("DELEG8_MAX_AGENTS"),
       minFreeMemPct: opts.minFreeMemPct ?? envNonNegInt("DELEG8_MIN_FREE_MEM_PCT"),
     });
-  const wireAgent = registerTools(server, registry, registry.getLogDir() ?? sessionLogDir);
+  const wireAgent = registerTools(server, registry, registry.getLogDir() ?? sessionLogDir, config.defaultModel);
   return { server, registry, wireAgent };
 }
 
@@ -202,7 +207,12 @@ async function sendNotification(
     }
   }
 }
-function registerTools(server: McpServer, registry: AgentRegistry, sessionLogDir?: string): (agent: PiAgent) => void {
+function registerTools(
+  server: McpServer,
+  registry: AgentRegistry,
+  sessionLogDir?: string,
+  defaultModel?: ModelSpec,
+): (agent: PiAgent) => void {
   const taskMap = new Map<string, TaskEntry>();
   let taskSeq = 0;
 
@@ -585,7 +595,10 @@ server.registerTool(
           modelId: z.string().describe("e.g. 'sonnet-4.5', 'gpt-5'"),
         })
         .optional()
-        .describe("Optional `set_model` frame sent before initial_prompt."),
+        .describe(
+          "Optional `set_model` frame sent before initial_prompt. Falls back to " +
+            "deleg8.local.md's default_model when omitted.",
+        ),
       fallback_model: z
         .object({
           provider: z.string().describe("e.g. 'openai'"),
@@ -725,8 +738,11 @@ server.registerTool(
         }
       }
 
-      if (args.model) {
-        const ok = await applyModel(args.model);
+      // Explicit `model` wins; otherwise fall back to deleg8.local.md's default_model
+      // (config.ts / loadDeleg8Config) so callers don't have to repeat it on every spawn.
+      const requestedModel = args.model ?? defaultModel;
+      if (requestedModel) {
+        const ok = await applyModel(requestedModel);
         if (!ok && args.fallback_model) {
           console.error(`[deleg8] ${agent.agentId}: primary model failed, trying fallback`);
           await applyModel(args.fallback_model);
