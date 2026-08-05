@@ -11,7 +11,7 @@
         ]
       },
       {
-        "matcher": "mcp__deleg8__spawn|mcp__deleg8__set_model",
+        "matcher": "mcp__(deleg8__|deleg_|deleg_deleg_)(spawn|set_model)",
         "hooks": [
           {
             "type": "command",
