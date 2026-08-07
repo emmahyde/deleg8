@@ -1,0 +1,698 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>The Room — a reactive multi-model agent space, and the office you watch it in</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --line: #e2e5e9;
+    --ink: #1f2328; --dim: #6a737d; --accent: #5e35b1;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, ui-sans-serif, sans-serif; font-size: 14px; line-height: 1.45; }
+  header { padding: 18px 24px 0; border-bottom: 1px solid var(--line); background: var(--panel); }
+  h1 { margin: 0 0 4px; font-size: 18px; font-weight: 600; }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 14px; }
+  main { padding: 24px; max-width: 1500px; margin: 0 auto; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    margin-bottom: 22px; padding: 16px 20px 20px; box-shadow: 0 1px 2px rgba(16,22,26,.04); }
+  section h2 { margin: 0 0 4px; font-size: 15px; font-weight: 600; color: var(--accent); }
+  section p.lede { margin: 0 0 14px; color: var(--dim); font-size: 12.5px; }
+  .mermaid { background: #ffffff; border: 1px solid var(--line); border-radius: 4px;
+    padding: 14px; overflow-x: auto; text-align: center; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 10px; padding: 8px 12px;
+    background: #f0f2f4; border: 1px solid var(--line); border-radius: 4px;
+    margin-bottom: 12px; font-size: 11.5px; }
+  .legend .chip { display: inline-flex; align-items: center; padding: 2px 8px;
+    border-radius: 10px; border: 1px solid; font-family: ui-monospace, monospace; font-weight: 500; }
+  .chip.l-new    { background: #ede7f6; border-color: #5e35b1; color: #311b92; }
+  .chip.l-exist  { background: #e3f2fd; border-color: #1565c0; color: #0d3b66; }
+  .chip.l-ledger { background: #e8f5e9; border-color: #2e7d32; color: #1b5e20; }
+  .chip.l-agent  { background: #e0f2f1; border-color: #00897b; color: #004d40; }
+  .chip.l-view   { background: #fff3e0; border-color: #ef6c00; color: #e65100; }
+  .chip.l-block  { background: #fce4ec; border-color: #ad1457; color: #880e4f; }
+  .chip.l-poly   { background: #fff; border-color: #90a4ae; color: #546e7a; }
+
+  .notes { font-size: 12.5px; color: #37414a; }
+  .notes li { margin: 5px 0; }
+  .notes code { background: #f0f2f4; border: 1px solid var(--line); border-radius: 3px;
+    padding: 0 4px; font-family: ui-monospace, monospace; color: #0d3b66; }
+  .tag-new { color: var(--accent); font-weight: 700; }
+  .tag-exist { color: #1565c0; font-weight: 700; }
+  .tag-warn { color: #ad1457; font-weight: 700; }
+
+  .mermaid .nodeLabel code, .mermaid .edgeLabel code {
+    font-family: ui-monospace, Menlo, monospace;
+    background: rgba(0, 0, 0, .07);
+    border: 1px solid rgba(0, 0, 0, .13);
+    border-radius: 4px;
+    padding: 0 4px;
+    font-size: 11px;
+  }
+  .mermaid .nodeLabel b { font-weight: 700; }
+  .mermaid svg .edgePaths path,
+  .mermaid svg path.flowchart-link {
+    stroke-width: 1.8px !important;
+  }
+  .mermaid svg g.node rect,
+  .mermaid svg g.node polygon,
+  .mermaid svg g.node path,
+  .mermaid svg g.node circle {
+    stroke-width: 1.8px !important;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>The Room &mdash; a reactive multi-model agent space, and the office you watch it in</h1>
+  <div class="sub">deleg8 &middot; <span class="tag-new">purple</span> = new, does not exist today &middot; <span class="tag-exist">blue</span> = ships in deleg8 now &middot; <span class="tag-warn">pink</span> = a gate that suppresses behavior on purpose</div>
+</header>
+
+<main>
+
+  <section>
+    <h2>Architecture &mdash; four new parts, one existing spine</h2>
+    <div class="legend">
+      <span class="chip l-new">new in deleg8</span>
+      <span class="chip l-exist">exists today</span>
+      <span class="chip l-ledger">append-only store</span>
+      <span class="chip l-agent">omp agent process</span>
+      <span class="chip l-view">browser view</span>
+    </div>
+    <p class="lede">The orchestrator spawns one <b>seat</b> per model &mdash; heterogeneous providers, capped at 6 concurrent omp processes. Seats never message each other directly: they bid for a floor, and the winner appends to a ledger. Everything the office renders is a projection of that ledger, so the browser is a pure view and closing it does not stop the panel. Two return paths are omitted to keep the chart readable: the Ledger feeds back into the Visibility policy on every append, and mirrors each event to the orchestrator as a <code>channel</code> notification.</p>
+<div class="mermaid">
+flowchart TB
+  ORCH["<b>Orchestrator</b> — Claude Code<br/><code>spawn</code> · <code>send</code> · <code>output</code>"]:::exist
+  CAST["<b>Casting</b><br/>seat = <code>agent_id</code> + persona<br/>+ <code>model{provider,modelId}</code>"]:::new
+  VIS["<b>Visibility policy</b><br/>renders each seat's view of the ledger<br/><b>empty during blind draft</b>"]:::new
+  A1["<code>archie</code> · claude-opus-5"]:::agent
+  A2["<code>deep</code> · deepseek-v4-pro"]:::agent
+  A3["<code>glm</code> · zai/glm-5.2"]:::agent
+  FLOOR{"<b>Floor</b><br/>who may speak now?"}:::new
+  SAY["<code>room_say</code><br/>only the floor holder may call it"]:::new
+  LEDGER[("<b>Ledger</b><br/>append-only <code>room_events</code>")]:::ledger
+  STAGE["<b>Stage</b><br/>ledger → view frames<br/>fixed tick + SSE"]:::new
+  SCENE["<b>Scene</b> — three.js<br/>kit-bashed glTF · baked lightmaps"]:::view
+  CHARS["<b>Characters</b><br/><code>mixamorig*</code> rig<br/>FSM over AnimationMixer"]:::view
+
+  ORCH -->|"one spawn per seat"| CAST
+  CAST -->|"<code>send</code> per-seat context"| VIS
+  VIS --> A1
+  VIS --> A2
+  VIS --> A3
+  A1 -->|"<code>room_bid</code>"| FLOOR
+  A2 -->|"<code>room_bid</code>"| FLOOR
+  A3 -->|"<code>room_bid</code>"| FLOOR
+  FLOOR -->|"grant — exclusive lock"| SAY
+  SAY --> LEDGER
+  LEDGER --> STAGE
+  STAGE -->|"interpolation buffer"| SCENE
+  SCENE --> CHARS
+
+  classDef exist fill:#e3f2fd,stroke:#1565c0,color:#0d3b66;
+  classDef new fill:#ede7f6,stroke:#5e35b1,color:#311b92;
+  classDef ledger fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+  classDef agent fill:#e0f2f1,stroke:#00897b,color:#004d40;
+  classDef view fill:#fff3e0,stroke:#ef6c00,color:#e65100;
+</div>
+  </section>
+
+  <section>
+    <h2>Behavioral triggers &mdash; why a seat speaks, and the two gates that keep it quiet</h2>
+    <div class="legend">
+      <span class="chip l-new">new mechanism</span>
+      <span class="chip l-block">deliberate suppression</span>
+      <span class="chip l-ledger">recorded to ledger</span>
+    </div>
+    <p class="lede">A seat never decides to speak &mdash; it decides to <b>bid</b>. Bidding is cheap and bounded; speaking is not. The two pink gates exist because the measured failure mode of a shared LLM channel is not chaos, it is collapse: everyone agreeing with whoever spoke first.</p>
+<div class="mermaid">
+flowchart TB
+  EV(["room event lands<br/><code>say</code> · <code>phase</code> · <code>tool_activity</code>"]):::event
+  EV --> V{"visible to this seat?"}
+  V -->|no| IDLE["stay idle<br/>desk animation continues"]:::idle
+  V -->|yes| T{"trigger matched?"}
+  T -->|none| PASS["record <code>PASS</code><br/>silence is an event, not an absence"]:::ledger
+  T -->|"mention · contradiction<br/>domain · direct address"| N{"adds new content?"}
+  N -->|"no — agreement only"| SUPP["<b>bid rejected</b><br/>anti-sycophancy gate"]:::block
+  N -->|yes| BID["<code>room_bid</code><br/>intensity + one-line reason"]:::new
+  BID --> K{"spoke in last K,<br/>unaddressed?"}
+  K -->|yes| DAMP["<b>weight decayed</b><br/>anti-domination gate"]:::block
+  K -->|no| Q["floor queue<br/>ordered by weighted intensity"]:::new
+  DAMP --> Q
+  Q --> G{"floor free?"}
+  G -->|no| Q
+  G -->|yes| SAY["grant → <code>room_say</code><br/>appended to ledger"]:::ledger
+  SUPP --> PASS
+
+  classDef event fill:#fff8e1,stroke:#f9a825,color:#6d4c41;
+  classDef new fill:#ede7f6,stroke:#5e35b1,color:#311b92;
+  classDef block fill:#fce4ec,stroke:#ad1457,color:#880e4f;
+  classDef ledger fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+  classDef idle fill:#eceff1,stroke:#90a4ae,color:#37474f;
+</div>
+  </section>
+
+  <section>
+    <h2>Standup lifecycle &mdash; blind draft first, reveal second</h2>
+    <div class="legend">
+      <span class="chip l-new">new phase</span>
+      <span class="chip l-ledger">decision recorded</span>
+      <span class="chip l-exist">real work, real tools</span>
+    </div>
+    <p class="lede">The ordering is the whole design. Every seat commits its take on the item <b>before seeing any peer's take</b>, and the reveal order is randomized per item. Anchoring needs a first speaker; a blind draft denies it one. Only after the reveal does the room become reactive, and that reactive phase is bounded. Two return paths are omitted from the chart: <b>Work</b> re-enters the reactive round when a seat's <code>tool_activity</code> is worth surfacing, and falls back to idle when the item is closed.</p>
+<div class="mermaid">
+flowchart TB
+  IDLE(["room idle — seats at desks"]):::event
+  IDLE -->|"an item is posted"| DRAFT
+  DRAFT["<b>Blind draft</b><br/>every seat drafts on the item<br/><b>with no peer context</b>"]:::new
+  DRAFT --> REVEAL["<b>Reveal</b><br/>all drafts appended at once<br/>order randomized per item"]:::new
+  REVEAL --> REACT["<b>Reactive round</b><br/>bid → floor → say<br/>bounded to R exchanges"]:::new
+  REACT --> X{"R spent, or zero bids?"}
+  X -->|no| REACT
+  X -->|yes| DECIDE["<b>Decide</b><br/>explicit protocol, chosen per item type:<br/>• vote → reasoning items<br/>• consensus → knowledge items"]:::ledger
+  DECIDE --> WORK["<b>Work</b><br/>seats disperse to desks<br/>real cwd, real tools"]:::exist
+
+  classDef event fill:#fff8e1,stroke:#f9a825,color:#6d4c41;
+  classDef new fill:#ede7f6,stroke:#5e35b1,color:#311b92;
+  classDef ledger fill:#e8f5e9,stroke:#2e7d32,color:#1b5e20;
+  classDef exist fill:#e3f2fd,stroke:#1565c0,color:#0d3b66;
+</div>
+  </section>
+
+  <section>
+    <h2>Data model &mdash; what the ledger actually stores</h2>
+    <div class="legend">
+      <span class="chip l-ledger">Ledger — append-only</span>
+      <span class="chip l-new">Casting — seat identity</span>
+      <span class="chip l-exist">Floor — turn control</span>
+      <span class="chip l-view">Stage — view projection</span>
+    </div>
+    <p class="lede">One append-only event table carries the room; everything else is either identity or a projection. <code>room_events</code> is the only durable truth &mdash; seat state, floor state, and the office scene are all derivable by replay, which is what makes the browser disposable.</p>
+<div class="mermaid">
+classDiagram
+  direction LR
+
+  namespace Ledger {
+    class RoomEvent {
+      &lt;&lt;room_events&gt;&gt;
+      int seq PK
+      string room_id FK
+      string actor_seat FK
+      string kind
+      string body
+      int reply_to_seq
+      int ts
+    }
+    class RoomItem {
+      &lt;&lt;room_items&gt;&gt;
+      uuid id PK
+      string room_id FK
+      string title
+      string phase
+    }
+  }
+
+  namespace Casting {
+    class Seat {
+      &lt;&lt;room_seats&gt;&gt;
+      string agent_id PK
+      string room_id FK
+      string provider
+      string model_id
+      int desk_index
+    }
+    class Persona {
+      &lt;&lt;seat_personas&gt;&gt;
+      string agent_id PK
+      string role
+      string expertise
+      string character_asset
+    }
+  }
+
+  namespace Floor {
+    class Bid {
+      &lt;&lt;floor_bids&gt;&gt;
+      uuid id PK
+      string agent_id FK
+      int trigger_seq FK
+      string trigger_kind
+      float intensity
+      string reason
+    }
+    class Grant {
+      &lt;&lt;floor_grants&gt;&gt;
+      uuid id PK
+      uuid bid_id FK
+      int granted_ts
+      int released_ts
+    }
+  }
+
+  namespace Stage {
+    class ViewFrame {
+      &lt;&lt;stage_frames&gt;&gt;
+      int tick PK
+      int through_seq FK
+      string zone_of_seat
+      string pose_of_seat
+    }
+  }
+
+  RoomItem "1" --> "*" RoomEvent : scopes
+  Seat "1" --> "1" Persona : wears
+  Seat "1" --> "*" Bid : raises
+  Bid "1" --> "0..1" Grant : wins
+  Grant ..> RoomEvent : authorizes one say
+  RoomEvent "*" --> "1" ViewFrame : projected into
+</div>
+  </section>
+
+  <section>
+    <h2>Notes</h2>
+    <ul class="notes">
+      <li><span class="tag-new">New</span> is everything under Casting, Floor, Ledger, and Stage. None of it exists on <code>main</code> today. The extension point is <code>HOST_TOOLS</code> at <code>src/server.ts:317</code> plus a matching branch in <code>handleHostRequest</code> at <code>src/server.ts:403</code> &mdash; the same seam <code>msg</code>, <code>task_create</code>, and <code>exclusive_acquire</code> already use.</li>
+      <li><span class="tag-exist">Reused, not rebuilt:</span> the Floor is a cooperative lock, and deleg8 already ships one. <code>exclusive_acquire</code> / <code>exclusive_release</code> (<code>src/server.ts:367</code>) blocks until granted and is already understood by spawned agents. The floor is that lock keyed on <code>room:&lt;id&gt;:floor</code>.</li>
+      <li><span class="tag-warn">The two pink gates are the point of the design.</span> A shared transcript plus per-seat personas is the exact condition measured to produce strongest majority dominance (<code>arXiv:2510.02360</code>, Spiral of Silence). Inter-agent sycophancy scores <b>below a single-agent baseline</b> (<code>arXiv:2509.23055</code>). Build the room without these gates and it looks alive while behaving as one model with extra latency.</li>
+      <li><b>Blind draft is not a nicety.</b> The same Spiral of Silence work isolates history as the anchoring signal &mdash; persona alone produced "diverse but uncorrelated opinions." Removing peer history for the first pass is the cheapest available defense, and it matches the All-Agents Drafting result that improved task performance in <code>arXiv:2502.19130</code>.</li>
+      <li><b>Bounded rounds, deliberately.</b> The same paper measures that <i>more discussion rounds before a decision reduce performance</i>. R is a hard cap, not a timeout.</li>
+      <li><b>Heterogeneity has a cost the diagram cannot show.</b> Agents align with the numerically dominant group <i>or the more capable model</i>, over 2,500 measured debates (<code>arXiv:2506.01332</code>). A panel of Opus + two smaller models will drift toward Opus. Seat composition is a tuning parameter, not decoration.</li>
+      <li><b>Deliberately omitted:</b> agent-to-agent direct messaging. There is no <code>whisper</code>. Every utterance is on the record, because a side channel reintroduces exactly the invisible influence the gates exist to bound.</li>
+      <li><span class="tag-warn">Assumption, not yet confirmed:</span> the office is a <b>view</b> over authoritative server-side state, not a spatial simulation. Seats do not have <code>look</code> or <code>move</code> tools and proximity does not gate who hears whom. Reversing this is a large change &mdash; it would feed space back into the prompts.</li>
+      <li><b>Graphics is not the constraint.</b> First-hand profiling puts the animated-SkinnedMesh cliff at 200&ndash;300 characters on 2014 hardware; <code>DELEG8_MAX_AGENTS</code> defaults to <b>6</b> (<code>src/server.ts:572</code>). Roughly two orders of magnitude of headroom. Naive per-seat <code>SkinnedMesh</code> + <code>AnimationMixer</code> is correct; instanced skinning is not worth its complexity here.</li>
+      <li><b>Character pipeline avoids a dead vendor.</b> Ready Player Me shut down public access 2026-01-31 after the Netflix acquisition, and it is the subject of most existing tutorials. Standardize instead on the <code>mixamorig*</code> bone-naming contract; VRM/VRoid, Microsoft RocketBox (MIT), and MPFB (CC0) all conform, so one animation set drives every seat through a small bone-name remap.</li>
+      <li><span class="tag-warn">Weakest-evidenced element:</span> the Stage's fixed-tick + interpolation-buffer transport. No corpus source covers websocket/SSE-driven three.js reconciliation directly; it is reasoned by analogy from <code>Crowd.update</code>'s <code>interpolatedPosition</code> in recast-navigation-js. Treat it as the first thing to validate, not as settled.</li>
+    </ul>
+  </section>
+</main>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11.4.1/dist/mermaid.esm.min.mjs'
+  import elkLayouts from 'https://cdn.jsdelivr.net/npm/@mermaid-js/layout-elk@0.1.7/dist/mermaid-layout-elk.esm.min.mjs'
+
+  mermaid.registerLayoutLoaders(elkLayouts)
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: 'loose', // keeps <code>/<b>/<br> in labels; default sanitization strips them
+    theme: 'default',
+    layout: 'elk',
+    themeVariables: {
+      background: '#ffffff', primaryColor: '#eef2f6',
+      primaryTextColor: '#1f2328', primaryBorderColor: '#90a4ae', lineColor: '#546e7a',
+      fontFamily: 'ui-monospace, Menlo, monospace', fontSize: '12px'
+    },
+    flowchart: { curve: 'linear', htmlLabels: true, defaultRenderer: 'elk' },
+    elk: {
+      // No elk.direction here: it overrides the per-diagram `flowchart TB` / `LR` header.
+      'elk.algorithm': 'layered',
+      'elk.edgeRouting': 'ORTHOGONAL',
+      'elk.layered.spacing.nodeNodeBetweenLayers': 55,
+      'elk.spacing.nodeNode': 42,
+      'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
+      // GREEDY cycle-breaking reverses whichever edges it likes, which flips a chart
+      // that has any return path (Work→idle, Ledger→Floor) upside down. DEPTH_FIRST
+      // breaks cycles along declaration order, so the first-declared node stays the root.
+      'elk.layered.cycleBreaking.strategy': 'DEPTH_FIRST',
+      'elk.layered.mergeEdges': true,
+      'elk.hierarchyHandling': 'INCLUDE_CHILDREN'
+    }
+  })
+
+  // ERD coloring is a post-render substring match on rendered textContent, not mermaid
+  // classDef/cssClass — namespaced classDiagram entities don't compose well with per-node
+  // :::tag assignment (one more line to maintain per table, desyncs as tables are added).
+  const PLANNING = []
+  const PLAN_FILL = '#e6e6f5', PLAN_STROKE = '#6c71c4', PLAN_INK = '#3a3f6b'
+  const TABLES = [
+    // [stereotypeSubstring, fill, stroke, ink]
+    ['room_events',   '#dcedc8', '#2e7d32', '#1b5e20'],
+    ['room_items',    '#e8f5e9', '#43a047', '#1b5e20'],
+    ['room_seats',    '#e1d5f5', '#5e35b1', '#311b92'],
+    ['seat_personas', '#ece3f8', '#7e57c2', '#4527a0'],
+    ['floor_bids',    '#d6e9f7', '#1565c0', '#0d3b66'],
+    ['floor_grants',  '#e3f2fd', '#1e88e5', '#0d3b66'],
+    ['stage_frames',  '#ffe9d1', '#ef6c00', '#e65100'],
+  ]
+  const NEW_COLS = []
+  const NEW_INK = '#1b5e20'
+
+  const paint = (g, fill, stroke, ink, dashed) => {
+    g.querySelectorAll('rect, path, polygon').forEach(s => {
+      s.style.fill = fill; s.style.stroke = stroke; s.style.strokeWidth = '1.6px'
+      if (dashed) s.style.strokeDasharray = '5 3'
+    })
+    g.querySelectorAll('text, foreignObject span, foreignObject p, foreignObject div').forEach(el => {
+      el.style.fill = ink; el.style.color = ink
+    })
+  }
+
+  const colorizeDelta = () => {
+    document.querySelectorAll('.mermaid[data-kind="class"] svg g.node').forEach(g => {
+      const txt = g.textContent || ''
+      if (PLANNING.some(tag => txt.includes(tag))) { paint(g, PLAN_FILL, PLAN_STROKE, PLAN_INK, true); return }
+      const hit = TABLES.find(([tag]) => txt.includes(tag))
+      if (hit) paint(g, hit[1], hit[2], hit[3], false)
+    })
+    document.querySelectorAll('.mermaid[data-kind="class"] svg text, .mermaid[data-kind="class"] svg foreignObject span, .mermaid[data-kind="class"] svg foreignObject p, .mermaid[data-kind="class"] svg foreignObject div').forEach(el => {
+      const t = (el.textContent || '').trim()
+      if (t && NEW_COLS.some(c => t.includes(c))) {
+        el.style.fill = NEW_INK; el.style.color = NEW_INK; el.style.fontWeight = '700'
+      }
+    })
+  }
+
+  // Geometry pass, separate from color: flatten every decision diamond to short+wide.
+  // Runs across ALL diagrams (flowchart decisions are g.node polygon), unlike the class-only colorizer.
+  // Single-line labels squash harder (no vertical room needed); multi-line stay taller.
+  const squashDiamonds = (sx = 1.45, syTall = 0.55, syFlat = 0.37, oneLinePx = 26) => {
+    document.querySelectorAll('.mermaid svg g.node').forEach(node => {
+      const poly = node.querySelector('polygon')
+      if (!poly || poly.dataset.squashed) return
+      const pts = poly.points
+      if (!pts || pts.numberOfItems !== 4) return
+      let cx = 0, cy = 0, minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+      for (let i = 0; i < 4; i++) {
+        const p = pts.getItem(i)
+        cx += p.x; cy += p.y
+        minX = Math.min(minX, p.x); maxX = Math.max(maxX, p.x)
+        minY = Math.min(minY, p.y); maxY = Math.max(maxY, p.y)
+      }
+      cx /= 4; cy /= 4
+      const tolX = (maxX - minX) * 0.05, tolY = (maxY - minY) * 0.05
+      let onV = 0, onH = 0
+      for (let i = 0; i < 4; i++) {
+        const p = pts.getItem(i)
+        if (Math.abs(p.x - cx) <= tolX) onV++
+        if (Math.abs(p.y - cy) <= tolY) onH++
+      }
+      if (onV < 2 || onH < 2) return
+      // Pre-squash footprint, consumed by orthogonalizeEdges() to find edge endpoints
+      // that ELK routed to the original (unsquashed) rhombus border.
+      poly.dataset.geom = JSON.stringify({ minX, maxX, minY, maxY })
+      const fo = node.querySelector('foreignObject')
+      const txt = node.querySelector('text')
+      let labelH = fo ? (fo.height?.baseVal?.value || 0) : 0
+      if (!labelH && txt) { try { labelH = txt.getBBox().height } catch (e) {} }
+      const sy = (labelH && labelH <= oneLinePx) ? syFlat : syTall
+      for (let i = 0; i < 4; i++) {
+        const p = pts.getItem(i)
+        p.x = cx + (p.x - cx) * sx
+        p.y = cy + (p.y - cy) * sy
+      }
+      poly.dataset.squashed = '1'
+    })
+  }
+
+  // Flatten a path's d into absolute points; bail on commands we can't safely rewrite.
+  const parsePath = d => {
+    const pts = []
+    const re = /([A-Za-z])([^A-Za-z]*)/g
+    let m
+    while ((m = re.exec(d))) {
+      const cmd = m[1]
+      const nums = (m[2].match(/-?\d*\.?\d+(?:e-?\d+)?/gi) || []).map(Number)
+      if (cmd === 'M' || cmd === 'L') {
+        for (let i = 0; i + 1 < nums.length; i += 2) pts.push({ x: nums[i], y: nums[i + 1] })
+      } else if (cmd === 'C') {
+        for (let i = 0; i + 5 < nums.length; i += 6) pts.push({ x: nums[i + 4], y: nums[i + 5] })
+      } else if (cmd === 'Q') {
+        for (let i = 0; i + 3 < nums.length; i += 4) pts.push({ x: nums[i + 2], y: nums[i + 3] })
+      } else if (cmd === 'Z' || cmd === 'z') {
+        continue
+      } else {
+        return null
+      }
+    }
+    return pts.length >= 2 ? pts : null
+  }
+
+  // House rule: every edge segment is axis-aligned. ELK routes to the pre-squash rhombus
+  // border, so squashed diamonds are left with diagonal stubs floating off their vertices.
+  // Pass 1: snap any endpoint inside a squashed diamond's original footprint onto the
+  // diamond's actual vertex (grouped arrows overlapping at the vertex is intended).
+  // Pass 2: rewrite every remaining diagonal segment as an L-bend.
+  const orthogonalizeEdges = () => {
+    document.querySelectorAll('.mermaid svg').forEach(svg => {
+      const diamonds = [...svg.querySelectorAll('g.node polygon[data-squashed]')].map(poly => {
+        const geom = JSON.parse(poly.dataset.geom || 'null')
+        const ctm = poly.getCTM()
+        if (!geom || !ctm) return null
+        const pp = poly.points
+        let top = null, bottom = null, left = null, right = null
+        for (let i = 0; i < 4; i++) {
+          const p = pp.getItem(i)
+          if (!top || p.y < top.y) top = { x: p.x, y: p.y }
+          if (!bottom || p.y > bottom.y) bottom = { x: p.x, y: p.y }
+          if (!left || p.x < left.x) left = { x: p.x, y: p.y }
+          if (!right || p.x > right.x) right = { x: p.x, y: p.y }
+        }
+        return { geom, ctm, top, bottom, left, right }
+      }).filter(Boolean)
+
+      const labels = [...svg.querySelectorAll('.edgeLabels g.edgeLabel')]
+      ;[...svg.querySelectorAll('.edgePaths path, path.flowchart-link')].forEach((path, pathIdx) => {
+        if (path.dataset.ortho) return
+
+        // Mermaid positions each edge label at the ORIGINAL path's midpoint; once the
+        // path is rebuilt the label floats in empty space. Re-center it on the new
+        // route's final segment (unique per edge, unlike the shared bus run).
+        const moveLabel = route => {
+          const g = labels[pathIdx]                  // document order matches path order
+          if (!g) return
+          const a = route[route.length - 2], b = route[route.length - 1]
+          // Midpoint, not a fixed back-off from the arrowhead: edges converging on one
+          // target share the endpoint, so equal back-offs stack their labels.
+          const p = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+          const pl = g.parentNode.getCTM()
+          if (!pl) return
+          const q = new DOMPoint(p.x, p.y).matrixTransform(pl.inverse().multiply(pctm))
+          g.setAttribute('transform', `translate(${q.x.toFixed(2)}, ${q.y.toFixed(2)})`)
+        }
+        const pts = parsePath(path.getAttribute('d') || '')
+        const pctm = path.getCTM()
+        if (!pts || !pctm) return
+        const inv = pctm.inverse()
+
+        const snap = (idx, nbrIdx) => {
+          const p = pts[idx]
+          for (const d of diamonds) {
+            const M = inv.multiply(d.ctm)
+            const a = new DOMPoint(d.geom.minX - 6, d.geom.minY - 6).matrixTransform(M)
+            const b = new DOMPoint(d.geom.maxX + 6, d.geom.maxY + 6).matrixTransform(M)
+            if (p.x < Math.min(a.x, b.x) || p.x > Math.max(a.x, b.x) ||
+                p.y < Math.min(a.y, b.y) || p.y > Math.max(a.y, b.y)) continue
+            const q = pts[nbrIdx]
+            const name = Math.abs(q.y - p.y) >= Math.abs(q.x - p.x)
+              ? (q.y > p.y ? 'bottom' : 'top')
+              : (q.x > p.x ? 'right' : 'left')
+            // Ingress arrows (idx > 0) back off the vertex by 4px so the arrowhead
+            // tip meets the outline like it does on box borders, instead of the
+            // head flaring over the diamond fill.
+            const off = idx > 0 ? 4 : 0
+            const v = new DOMPoint(
+              d[name].x + (name === 'left' ? -off : name === 'right' ? off : 0),
+              d[name].y + (name === 'top' ? -off : name === 'bottom' ? off : 0)
+            ).matrixTransform(M)
+            pts[idx] = { x: v.x, y: v.y, axis: (name === 'top' || name === 'bottom') ? 'v' : 'h' }
+            return
+          }
+        }
+        snap(0, 1)
+        snap(pts.length - 1, pts.length - 2)
+
+        // A vertex-snapped edge ignores ELK's waypoints entirely: it is rebuilt as a
+        // two-bend route through a bus line at a fixed offset from the vertex. Every
+        // edge on the same vertex shares the same offset, so their runs overlap into
+        // one visual trunk + bus (the grouped-arrow look; overlap is intended).
+        const S = pts[0], E = pts[pts.length - 1]
+        if (S.axis || E.axis) {
+          const BUS = 36
+          let out2
+          const axis = S.axis || E.axis
+          if (axis === 'v') {
+            if (Math.abs(E.x - S.x) < 1) out2 = [S, E]
+            else {
+              const sgn = Math.sign(E.y - S.y) || 1
+              const off = Math.min(BUS, Math.abs(E.y - S.y) / 2) * sgn
+              const busY = S.axis ? S.y + off : E.y - off
+              out2 = [S, { x: S.x, y: busY }, { x: E.x, y: busY }, E]
+            }
+          } else {
+            if (Math.abs(E.y - S.y) < 1) out2 = [S, E]
+            else {
+              const sgn = Math.sign(E.x - S.x) || 1
+              const off = Math.min(BUS, Math.abs(E.x - S.x) / 2) * sgn
+              const busX = S.axis ? S.x + off : E.x - off
+              out2 = [S, { x: busX, y: S.y }, { x: busX, y: E.y }, E]
+            }
+          }
+          path.setAttribute('d', 'M' + out2.map(p => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join('L'))
+          moveLabel(out2)
+          path.dataset.ortho = '1'
+          return
+        }
+
+        // ELK emits chamfered corners (short diagonal corner cuts); keeping them turns each
+        // into a tiny stair after the L-bend pass. Drop sub-12px waypoints first so bends
+        // land on the true corner, then flatten near-axis segments before inserting bends.
+        const clean = [pts[0]]
+        for (let i = 1; i < pts.length - 1; i++) {
+          const p = clean[clean.length - 1], q = pts[i]
+          if (Math.hypot(q.x - p.x, q.y - p.y) >= 12) clean.push(q)
+        }
+        clean.push(pts[pts.length - 1])
+
+        const NEAR = 6
+        const out = [clean[0]]
+        for (let i = 1; i < clean.length; i++) {
+          const p = out[out.length - 1], q = { x: clean[i].x, y: clean[i].y }
+          const dx = q.x - p.x, dy = q.y - p.y
+          const last = i === clean.length - 1
+          if (Math.abs(dx) <= NEAR && Math.abs(dy) <= NEAR && !last) continue
+          if (Math.abs(dx) <= NEAR) {
+            if (!last) q.x = p.x
+            else if (Math.abs(dx) > 0.5) out.push({ x: q.x, y: p.y })
+          } else if (Math.abs(dy) <= NEAR) {
+            if (!last) q.y = p.y
+            else if (Math.abs(dy) > 0.5) out.push({ x: p.x, y: q.y })
+          } else {
+            let firstAxis
+            if (i === 1 && pts[0].axis) firstAxis = pts[0].axis
+            else if (last) firstAxis = Math.abs(dy) >= Math.abs(dx) ? 'h' : 'v'
+            else firstAxis = Math.abs(dx) >= Math.abs(dy) ? 'h' : 'v'
+            out.push(firstAxis === 'v' ? { x: p.x, y: q.y } : { x: q.x, y: p.y })
+          }
+          out.push(q)
+        }
+        path.setAttribute('d', 'M' + out.map(p => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join('L'))
+        path.dataset.ortho = '1'
+      })
+    })
+  }
+
+  // Edges sharing a common ingress or egress point form a visual group (they overlap
+  // into one trunk/bus after the rebuild); tint each group's lines, arrowheads, and
+  // label backgrounds with one hue so a label reads as belonging to its line.
+  // Ordered for max hue separation between consecutive groups — green/teal or
+  // indigo/purple side by side read as the same line at thin stroke widths.
+  const GROUP_COLORS = [
+    ['#2e7d32', '#e8f5e9'], ['#3949ab', '#e8eaf6'], ['#ef6c00', '#fff3e0'],
+    ['#ad1457', '#fce4ec'], ['#00838f', '#e0f7fa'], ['#5e35b1', '#ede7f6']
+  ]
+  const colorizeEdgeGroups = () => {
+    document.querySelectorAll('.mermaid svg').forEach(svg => {
+      const labels = [...svg.querySelectorAll('.edgeLabels g.edgeLabel')]
+      const recs = [...svg.querySelectorAll('.edgePaths path, path.flowchart-link')].map((path, i) => {
+        const pts = parsePath(path.getAttribute('d') || '')
+        const ctm = path.getCTM()
+        if (!pts || !ctm) return null
+        return {
+          path, label: labels[i],
+          S: new DOMPoint(pts[0].x, pts[0].y).matrixTransform(ctm),
+          E: new DOMPoint(pts[pts.length - 1].x, pts[pts.length - 1].y).matrixTransform(ctm)
+        }
+      }).filter(Boolean)
+      const clusters = []
+      const put = (rec, p, kind) => {
+        // 25px tolerance: arrows hit a node border at slightly different points.
+        let c = clusters.find(c => c.kind === kind && Math.hypot(c.x - p.x, c.y - p.y) <= 25)
+        if (!c) { c = { kind, x: p.x, y: p.y, members: [] }; clusters.push(c) }
+        c.members.push(rec)
+      }
+      recs.forEach(r => { put(r, r.S, 'egress'); put(r, r.E, 'ingress') })
+      let ci = 0
+      const done = new Set()
+      clusters.filter(c => c.members.length >= 2)
+        .sort((a, b) => b.members.length - a.members.length)   // larger clusters claim edges first
+        .forEach(c => {
+          const fresh = c.members.filter(r => !done.has(r))
+          if (fresh.length < 2) return
+          const [stroke, bg] = GROUP_COLORS[ci++ % GROUP_COLORS.length]
+          fresh.forEach(r => {
+            done.add(r)
+            r.path.style.stroke = stroke
+            // Arrowheads use a shared marker def; clone it per color or every arrow
+            // in the svg changes hue together.
+            const mref = (r.path.getAttribute('marker-end') || '').match(/url\(['"]?#([^'")]+)/)
+            if (mref) {
+              const mid = mref[1] + '-' + stroke.slice(1)
+              let cl = svg.querySelector('#' + CSS.escape(mid)) || document.getElementById(mid)
+              if (!cl) {
+                const orig = svg.querySelector('#' + CSS.escape(mref[1])) || document.getElementById(mref[1])
+                if (orig) {
+                  cl = orig.cloneNode(true)
+                  cl.id = mid
+                  cl.querySelectorAll('*').forEach(e => { e.style.fill = stroke; e.style.stroke = stroke })
+                  orig.parentNode.appendChild(cl)
+                }
+              }
+              if (cl) r.path.setAttribute('marker-end', `url(#${mid})`)
+            }
+            if (r.label) {
+              r.label.querySelectorAll('rect').forEach(e => { e.style.fill = bg })
+              r.label.querySelectorAll('span, div, p').forEach(e => { e.style.background = bg })
+            }
+          })
+        })
+    })
+  }
+
+  // Mermaid sizes an svg to its natural layout extent, so a tall chart scrolls past the
+  // fold and can never be seen whole. Scale each one to the tighter of container width
+  // and viewport height. Must run AFTER the geometry passes — they read getCTM(), and a
+  // rescale in between would shift every coordinate they resolve.
+  const FIT_MARGIN_PX = 30
+  const MIN_SCALE = 0.85   // below this the 12px node text stops being readable
+  const fitToViewport = () => {
+    document.querySelectorAll('.mermaid svg').forEach(svg => {
+      const vb = svg.viewBox?.baseVal
+      if (!vb || !vb.width || !vb.height) return
+      const maxW = (svg.parentElement?.clientWidth || 0) - FIT_MARGIN_PX
+      const maxH = window.innerHeight * 0.92
+      if (maxW <= 0) return
+      // Height is a hard cap; width is best-effort. A wide LR chart squeezed to the
+      // column would drop below MIN_SCALE, so it overflows into the container's
+      // horizontal scroll instead of being shrunk into illegibility.
+      let scale = Math.min(1, maxH / vb.height)
+      if (vb.width * scale > maxW) scale = Math.max(MIN_SCALE, maxW / vb.width)
+      svg.style.maxWidth = 'none'   // mermaid writes an inline max-width that caps the fit
+      svg.style.width = `${(vb.width * scale).toFixed(1)}px`
+      svg.style.height = `${(vb.height * scale).toFixed(1)}px`
+    })
+  }
+
+  const passes = () => { colorizeDelta(); squashDiamonds(); orthogonalizeEdges(); colorizeEdgeGroups(); fitToViewport() }
+
+  let fitTimer
+  window.addEventListener('resize', () => { clearTimeout(fitTimer); fitTimer = setTimeout(fitToViewport, 120) })
+
+  const renderAll = async () => {
+    // Tag data-kind BEFORE mermaid.run() wipes textContent — the colorizer depends on it.
+    document.querySelectorAll('.mermaid').forEach(m => {
+      const src = (m.textContent || '').trim()
+      m.dataset.kind = /^classDiagram\b/.test(src) ? 'class' : 'flowchart'
+    })
+    // Sequential render with a tick between blocks: mermaid ids derive from Date.now(),
+    // and two diagrams rendered in the same millisecond collide — the second one's ELK
+    // layout then writes into the first svg (duplicate-id querySelector hit).
+    for (const el of document.querySelectorAll('.mermaid')) {
+      try { await mermaid.run({ nodes: [el] }) } catch (e) { console.error(e) }
+      await new Promise(r => setTimeout(r, 10))
+    }
+    passes()
+    setTimeout(passes, 400)
+    setTimeout(passes, 1200)
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', renderAll)
+  else renderAll()
+
+  // Observer runs only the idempotent passes: colorizeEdgeGroups() appends marker clones
+  // (a childList mutation), so putting it here would re-fire the observer on its own work.
+  new MutationObserver(() => { colorizeDelta(); squashDiamonds(); orthogonalizeEdges() }).observe(document.body, { childList: true, subtree: true })
+</script>
+</body>
+</html>
