@@ -37,17 +37,22 @@ Every subagent MUST be a deleg8 spawn with a descriptive `agent_id` (e.g. `"comp
 for read-only exploration only. Every subagent that writes code, runs commands, or
 performs multi-step work MUST be a deleg8 spawn with a descriptive `agent_id`.
 
-## Tool set (7 tools)
+## Tool set (10 tools)
 
 | Tool | Purpose |
 |---|---|
-| `spawn` | Launch a new omp agent, optionally with first prompt |
+| `spawn` | Launch a new omp agent — first prompt, model, and enforcement config (`denylist`, `own`, `preamble`, `exclusive`, `role: "leaf"`) |
 | `send` | Send follow-up to existing agent (auto-resumes idle agents) |
 | `output` | Read buffered frames — digest, summary, or raw |
-| `status` | Check one agent's state (running/idle/dead) |
-| `list` | Snapshot of all agents |
+| `status` | Check one agent's state (running/idle/dead) + cost |
+| `list` | Snapshot of all agents + server build info |
 | `stop` | Abort, terminate, remove from registry |
 | `prune` | Drop dead/idle agents from registry |
+| `tasks` | Query the agent task registry |
+| `task_create` | Create a tracked task for an agent |
+| `task_update` | Update a task's status/note |
+
+Spawned agents also get six host tools of their own — `msg`, `task_create`, `task_update`, `task_list`, `exclusive_acquire`, `exclusive_release` — and their calls surface in your session as `<channel source="deleg8">` events. Tell agents in their prompt to use these by name.
 
 Full parameter reference: [references/tools.md](references/tools.md).
 
@@ -143,8 +148,25 @@ Three output formats:
 .frames | map(select(.frame.type == "response"))  # response frames in raw mode
 ```
 
-Full frame catalog: `mcp://deleg8/schema-frames` resource. See also
-[references/frame-catalog.md](references/frame-catalog.md).
+Full frame catalog: `deleg8://schema/frames` resource. See also [references/frame-catalog.md](references/frame-catalog.md).
+
+## Coordination & guardrails
+
+For fan-outs where agents share files or resources, configure enforcement at spawn:
+
+```
+spawn(agent_id="worker-a",
+  own=["src/moduleA/**"],                      // write-scope glob
+  denylist=["git (reset|checkout|clean)"],     // banned command regexes
+  preamble="API contract: ...",                // shared ground truth for every agent
+  exclusive=[{pattern: "bun test", wait: true}], // one agent at a time; others queue
+  role="leaf",                                 // forbid sub-delegation
+  initial_prompt="...")
+```
+
+Enforcement is cooperative: constraints are injected into the prompt, and violations fire real-time channel notifications (deleg8 cannot intercept omp's internal tool execution). For `exclusive`, tell the agent to call `exclusive_acquire`/`exclusive_release` around the command.
+
+**Progress tracking:** instruct agents to `task_create` each unit of sub-work and `task_update` as they go — each call emits a live channel event, and `tasks` gives you the full registry. Instruct agents to `msg` you at milestones. Capacity: max 6 concurrent agents by default (`DELEG8_MAX_AGENTS`); spawn is rejected past the cap or under 15% free memory.
 
 ## Lifecycle management
 
@@ -174,14 +196,13 @@ spawn(agent_id="fast", model={provider:"anthropic", modelId:"haiku-4.5"})
 spawn(agent_id="deep", model={provider:"anthropic", modelId:"opus-4.5"})
 ```
 
-## MCP resource
+## MCP resources
 
-The `deleg8://schema/frames` resource catalogs every frame type omp emits,
-with field shapes and worked jq examples. Read it before writing non-trivial
-jq filters.
+- `deleg8://schema/frames` — every frame type omp emits, with field shapes and worked jq examples. Read it before writing non-trivial jq filters.
+- `deleg8://schema/channel-events` — channel events, the six agent-side host tools (input shapes, byte limits), and the events-global.ndjson feed.
 
 ## Detailed references
 
-- [references/tools.md](references/tools.md) — full parameter reference for all 7 tools
+- [references/tools.md](references/tools.md) — full parameter reference for all 10 tools
 - [references/when-to-use.md](references/when-to-use.md) — detailed decision framework with worked examples
 - [references/frame-catalog.md](references/frame-catalog.md) — frame types for jq filter writing
