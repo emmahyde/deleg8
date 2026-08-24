@@ -84,6 +84,11 @@ let ID_COUNTER = 0;
 const MAX_LOG_LINE_BYTES = 4 * 1024;
 const MAX_LOG_FILE_BYTES = 50 * 1024 * 1024;
 
+// ~100/sec, each carrying the whole partial message: they crowd tool calls out
+// of the log faster than rotation trims it. message_end carries the assembled
+// message, and summarize.ts drops these too.
+const UNLOGGED_FRAME_TYPES = new Set(["message_update"]);
+
 /** Reduce a frame to a bounded-size line for the debug .log, summarizing rather
  * than truncating mid-JSON when the full frame would exceed the per-line cap. */
 function summarizeFrameForLog(frame: Frame): string {
@@ -723,7 +728,7 @@ export class PiAgent {
         if (typeof cost === "number") this.totalCostUsd += cost;
       }
     }
-    if (this.logPath) {
+    if (this.logPath && !UNLOGGED_FRAME_TYPES.has(frame.type ?? "")) {
       try {
         const line = summarizeFrameForLog(frame) + "\n";
         const cache = { value: this.logSize, init: this.logSizeInitialized };
