@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PreToolUse guard for mcp__deleg8__spawn / mcp__deleg8__set_model.
+# PreToolUse guard for canonical and legacy deleg8 MCP spawn names.
 # deleg8 is pinned to non-Anthropic models (operator rule). Deny any call
 # whose model/provider argument looks Anthropic: matches /anthropic/i
 # anywhere, or starts with "claude". Only those two fields are checked —
