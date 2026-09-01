@@ -8,7 +8,7 @@
       "name": "deleg8",
       "source": "./",
       "description": "Persistent oh-my-pi (omp) subagents via MCP. Makes deleg8 the default delegation mechanism — spawns named, resumable subagents instead of bare one-shot task() calls.",
-      "version": "0.2.2",
+      "version": "0.2.3",
       "author": {
         "name": "Emma Hyde"
       },

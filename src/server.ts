@@ -83,7 +83,7 @@ export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentSer
   // configures deleg8 itself, not any individual agent's own working directory.
   const config = loadDeleg8Config();
   const server = new McpServer(
-    { name: "deleg8", version: "0.2.0" },
+    { name: "deleg8", version: "0.2.3" },
     {
       capabilities: {
         experimental: { "claude/channel": {} },
