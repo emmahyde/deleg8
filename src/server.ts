@@ -17,7 +17,7 @@ import type { Frame } from "./frames.ts";
 import { jqFilter } from "./jq-filter.ts";
 import { AgentRegistry } from "./registry.ts";
 import { drainEvents, enqueueEvent } from "./persist.ts";
-import { FRAME_SCHEMA } from "./schema.ts";
+import { CHANNEL_EVENTS_SCHEMA, FRAME_SCHEMA } from "./schema.ts";
 import { digest, extractTextContent, summarize } from "./summarize.ts";
 import { makeElicitBridge } from "./ui-bridge.ts";
 
@@ -83,7 +83,7 @@ export function createPiAgentServer(opts: PiAgentServerOptions = {}): PiAgentSer
   // configures deleg8 itself, not any individual agent's own working directory.
   const config = loadDeleg8Config();
   const server = new McpServer(
-    { name: "deleg8", version: "0.1.0" },
+    { name: "deleg8", version: "0.2.3" },
     {
       capabilities: {
         experimental: { "claude/channel": {} },
@@ -489,6 +489,18 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
       const pattern = String(args.pattern ?? "");
       if (!pattern) {
         return hostResult(id, { error: "exclusive_acquire requires a `pattern` argument" }, true);
+      }
+      if (pattern.startsWith("room:")) {
+        return hostResult(
+          id,
+          {
+            error: {
+              code: "reserved_pattern",
+              message: "room:* patterns are reserved for the Room engine",
+            },
+          },
+          true,
+        );
       }
       const acquired = registry.acquireExclusive(pattern, agentId);
       void notify(
@@ -1229,6 +1241,28 @@ server.registerResource(
         uri: uri.href,
         mimeType: "application/json",
         text: JSON.stringify(FRAME_SCHEMA, null, 2),
+      },
+    ],
+  }),
+);
+
+server.registerResource(
+  "schema-channel-events",
+  "deleg8://schema/channel-events",
+  {
+    title: "deleg8 channel events & agent host tools",
+    description:
+      "Catalog of <channel source=\"deleg8\"> notification events, the six host tools " +
+      "spawned agents can call (with input shapes and byte limits), and the " +
+      "events-global.ndjson cross-session feed.",
+    mimeType: "application/json",
+  },
+  async (uri) => ({
+    contents: [
+      {
+        uri: uri.href,
+        mimeType: "application/json",
+        text: JSON.stringify(CHANNEL_EVENTS_SCHEMA, null, 2),
       },
     ],
   }),

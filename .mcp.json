@@ -2,10 +2,7 @@
   "mcpServers": {
     "deleg8": {
       "command": "bun",
-      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/src/server.ts"],
-      "env": {
-        "OMP_BIN": "${OMP_BIN-omp}"
-      }
+      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/src/server.ts"]
     }
   }
 }

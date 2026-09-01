@@ -1,0 +1,13 @@
+https://en.wikipedia.org/wiki/Ready_Player_Me	RPM history, Netflix acquisition, shutdown status
+https://docs.readyplayer.me/ready-player-me/integration-guides/unity/animations/ready-player-me-animation-library	RPM's own Mixamo-derived animation library, retargeting claims
+https://docs.readyplayer.me/ready-player-me/integration-guides/unreal-engine/animations/loading-mixamo-animations	RPM avatar + Mixamo animation compatibility mechanics
+https://discoverthreejs.com/book/first-steps/animation-system/	authoritative three.js AnimationMixer/AnimationClip/AnimationAction reference
+https://discourse.threejs.org/t/animationaction-crossfadeto-not-working/63467	real-world crossFadeTo pitfalls, practitioner discussion
+https://discourse.threejs.org/t/animated-instanced-skinned-meshes-gltf/41958	instanced skinned mesh performance discussion, GPU skinning limits
+https://github.com/mrdoob/three.js/blob/dev/examples/webgl_animation_skinning_blending.html	official three.js example of multi-clip skinning blend
+https://github.com/met4citizen/talkinghead	maintained JS lib for real-time viseme lip-sync on full-body 3D avatars (RPM-compatible)
+https://wawasensei.dev/tuto/react-three-fiber-tutorial-lip-sync	concrete three.js/R3F lip-sync tutorial using Rhubarb + RPM
+https://wiki.vrchat.com/wiki/Visemes	canonical Oculus 15-viseme reference used across engines
+https://github.com/meshonline/rhubarb-lip-sync	Rhubarb Lip Sync tool fork, maintenance status check
+https://home.convai.com/blog/lip-syncing-virtual-ai-characters-techniques-integration-and-future-trends	2025/2026 industry survey of lip-sync approaches and tradeoffs
+https://gabber.dev/blog/build-a-threejs-3d-avatar-with-realtime-ai-vision-voice-lip-sync-nextjs	real-time AI-driven three.js avatar architecture example

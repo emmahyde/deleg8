@@ -7,3 +7,6 @@ bun.lockb
 *.log
 .DS_Store
 banks/
+
+# Scraped page cache from research runs; the corpus-summary.md and urls.txt beside it are the keepers.
+.claude/research/*/pages/

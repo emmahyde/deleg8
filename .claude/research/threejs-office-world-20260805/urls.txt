@@ -1,0 +1,14 @@
+https://github.com/pmndrs/react-three-fiber	r3f repo - maintenance/status
+https://graffersid.com/react-three-fiber-vs-three-js/	r3f vs three.js 2026 comparison
+https://www.pkgpulse.com/guides/threejs-vs-react-three-fiber-vs-babylonjs-3d-webgl-2026	three-way engine comparison 2026
+https://github.com/isaac-mason/navcat	newer navmesh lib, maintenance status
+https://github.com/donmccurdy/three-pathfinding	three-pathfinding querying lib, README/limits
+https://github.com/isaac-mason/recast-navigation-js	recast-navigation-js wasm navmesh gen+query
+https://tchayen.github.io/posts/baked-lighting-in-r3f	baked lighting workflow in r3f
+https://discourse.threejs.org/t/how-to-setup-lightmap-bake-from-blender-to-gltf/34924	blender->gltf lightmap bake workflow
+https://cryingcrocgames.itch.io/procedurally-generated-rooms	procedural room generation example
+https://marceloretana.com/checklist/threejs-performance-checklist	60fps perf checklist
+https://discourse.threejs.org/t/optimization-of-large-amounts-100-1000-of-skinned-meshes-cpu-bottlenecks/58196	skinned mesh crowd perf ceiling
+https://waelyasmina.net/articles/instanced-rendering-in-three-js/	InstancedMesh mechanics and draw-call math
+https://discourse.threejs.org/t/animated-instanced-skinned-meshes-gltf/41958	instanced+animated skinned mesh workaround
+https://www.intelligentgraphicandcode.com/development/threejs-interfaces/performance	60fps optimization patterns

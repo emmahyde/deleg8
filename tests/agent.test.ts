@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -309,4 +309,26 @@ describe("PiAgent lifecycle (session + suspend/resume)", () => {
     },
     10_000,
   );
+});
+
+describe("debug log", () => {
+  test("streaming deltas stay out of the log so tool calls survive in it", () => {
+    const dir = mkdtempSync(join(tmpdir(), "deleg8-log-"));
+    const logPath = join(dir, "a.log");
+    const a = new PiAgent("log-test", { command: ["bun", "run", MOCK_PATH], logPath });
+    const feed = (f: Frame) => (a as unknown as { onFrame(f: Frame): void }).onFrame(f);
+
+    try {
+      for (let i = 0; i < 500; i++) {
+        feed({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "x".repeat(2000) } });
+      }
+      feed({ type: "tool_execution_start", toolName: "write", args: { path: "src/thing.ts" } });
+      feed({ type: "message_end", message: { role: "assistant", content: [] } });
+
+      const types = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l).type);
+      expect(types).toEqual(["tool_execution_start", "message_end"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

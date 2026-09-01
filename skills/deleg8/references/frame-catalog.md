@@ -23,16 +23,31 @@ Use it when writing jq filters against `output(format="raw")`.
 | `message_update` | `message.content[]` | Incremental content block (streaming) |
 | `message_end` | `message.role`, `message.content[]`, `message.model?`, `message.usage?`, `message.stopReason?` | Complete message |
 
-Message content blocks: `{type: "text", text: "..."}` or `{type: "tool_use", ...}` etc.
+### Message shape
+
+Message objects (in `message_start`/`end`/`update`):
+
+| Field | Type |
+|---|---|
+| `role` | `"user" \| "assistant" \| "tool"` |
+| `content` | ContentBlock[]; `block.type` ∈ `{text, thinking, tool_use, tool_result}` |
+| `model`, `provider` | string? (assistant only) |
+| `usage` | `{input, output, cacheRead, cacheWrite, totalTokens, cost}?` |
+| `stopReason` | string? |
+| `timestamp` | number? |
+
+Content block shapes: `text` → `{text}`; `thinking` → `{thinking, thinkingSignature?}`; `tool_use` → `{id, name, input}`; `tool_result` → `{tool_use_id, content, isError?}`.
 
 ### Control frames
 
+Fields live directly on the frame object (`.frame.method`, not `.frame.request.method`).
+
 | Type | Fields | Meaning |
 |---|---|---|
-| `response` | `response` (object or null) | omp's response to a prompt frame. Non-null on success. |
-| `extension_ui_request` | `request.method` (`select`/`confirm`/`input`/`editor`), `request.*` | Clarifying question for the user |
-| `host_tool_call` | `tool.name`, `tool.input` | omp calling a host tool |
-| `host_uri_request` | `request.uri`, `request.method` | omp requesting a URI read |
+| `response` | `id`, `command` (`"prompt"`/`"set_model"`/`"abort"`/...), `success` (boolean), `data?`, `error?` | Response to a request, correlated by `id` |
+| `extension_ui_request` | `id`, `method`, `title?`, `message?`, `options?` (select), `placeholder?` (input), `prefill?` (editor) | Host dialog. ACTIVE methods (`select`/`confirm`/`input`/`editor`) need a response; PASSIVE (`notify`/`setStatus`/`setWidget`/`setTitle`/`open_url`/`cancel`/`set_editor_text`) are fire-and-forget |
+| `host_tool_call` | `id`, `name`, `input` | omp calling a registered host tool (e.g. `msg`, `task_create`, `exclusive_acquire`) |
+| `host_uri_request` | `id`, `uri` | omp asking the host to resolve a custom URI |
 
 ## jq patterns
 
@@ -40,6 +55,12 @@ Message content blocks: `{type: "text", text: "..."}` or `{type: "tool_use", ...
 
 ```jq
 .frames | map(select(.frame.type == "message_end" and .frame.message.role == "assistant")) | last.frame.message.content | map(select(.type == "text") | .text) | join("")
+```
+
+### Find failed responses (raw mode)
+
+```jq
+[.frames[] | select(.frame.type == "response" and .frame.success == false)]
 ```
 
 ### Find all errors (summary mode)

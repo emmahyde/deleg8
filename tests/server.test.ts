@@ -144,6 +144,34 @@ describe("deleg8 MCP server integration", () => {
   );
 
   test(
+    "rejects room floor patterns from agent lock requests",
+    async () => {
+      const h = await makeHarness();
+      harnesses.push(h);
+      await h.client.callTool({ name: "spawn", arguments: { agent_id: "room-seat" } });
+
+      const result = callJson(
+        await h.client.callTool({
+          name: "send",
+          arguments: {
+            agent_id: "room-seat",
+            message: 'CALL:exclusive_acquire:{"pattern":"room:room-1:floor"}',
+          },
+        }),
+      );
+
+      expect(result.response.data.tool_is_error).toBe(true);
+      expect(JSON.parse(result.response.data.tool_result.content[0].text)).toEqual({
+        error: {
+          code: "reserved_pattern",
+          message: "room:* patterns are reserved for the Room engine",
+        },
+      });
+    },
+    15_000,
+  );
+
+  test(
     "list reports state and session metadata",
     async () => {
       const h = await makeHarness();

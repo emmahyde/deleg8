@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>A spawned deleg8 agent wants to send a short mid-task progress note back to its orchestrator using the host tool designed for that purpose. According to the server's published schemas, what is the maximum size of that note in bytes? Answer with a number only.</question>
+    <answer>2000</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>The deleg8 server publishes a catalog of the NDJSON frame types its subagents emit. One frame type is explicitly described as the most useful for writing projections. Which frame type is it? Answer with the exact frame type name.</question>
+    <answer>message_end</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Every channel notification deleg8 pushes into a session is also mirrored to a cross-session feed file on disk that survives clients dropping channel frames. What is the filename (not the full path) of that feed? Answer with the filename only.</question>
+    <answer>events-global.ndjson</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>A deleg8 subagent triggers a host dialog with the method `setWidget`. Does the host need to send a response for the agent to continue? Answer yes or no.</question>
+    <answer>no</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>An orchestrator already has six agents running concurrently under a default deleg8 configuration (no environment overrides) and calls spawn for a seventh. Will the spawn be accepted? Answer yes or no.</question>
+    <answer>no</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>An orchestrator calls the tool that reads a subagent's buffered output without passing any format parameter. Which format does it get? Answer with the format name only.</question>
+    <answer>digest</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the usage object attached to a completed assistant message frame, which field carries the count of tokens that were read from the prompt cache? Answer with the exact field name.</question>
+    <answer>cacheRead</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>A long-running agent keeps registering units of sub-work through its task-creation host tool. After how many registered tasks for that one agent will further creations be rejected? Answer with a number only.</question>
+    <answer>100</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>One kind of message content block carries the agent's internal reasoning and may include a cryptographic signature field alongside it. What is the exact name of that signature field?</question>
+    <answer>thinkingSignature</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the collapsed summary output format, each entry has a `kind` field. Which kind value marks an entry produced by a subagent invoking one of the tools the host registered into it? Answer with the exact kind value.</question>
+    <answer>host_request</answer>
+  </qa_pair>
+</evaluation>

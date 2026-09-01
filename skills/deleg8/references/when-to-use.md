@@ -100,6 +100,19 @@ spawn(agent_id="migrate-users", initial_prompt="Migrate users table per plan: [d
 spawn(agent_id="migrate-orders", initial_prompt="Migrate orders table per plan: [details]")
 ```
 
+### Coordinated fan-out (overlapping resources)
+
+Agents share a repo or a serialized resource (test runner, port, migration):
+
+```
+spawn(agent_id="mod-a", own=["src/a/**"], exclusive=[{pattern:"bun test", wait:true}],
+  preamble="Shared contract: [API notes]", initial_prompt="... Call exclusive_acquire
+  before running tests and exclusive_release after. task_create each sub-step.")
+spawn(agent_id="mod-b", own=["src/b/**"], ...same exclusive/preamble...)
+
+tasks()   → live progress across both agents
+```
+
 ## Anti-patterns (all BANNED)
 
 * Spawning a bare `task("do X")` — always use deleg8 with agent_id
@@ -109,3 +122,6 @@ spawn(agent_id="migrate-orders", initial_prompt="Migrate orders table per plan: 
 * Using raw format without jq — context bloat; always project
 * Forgetting `background: true` for long-running work — blocks your turn
 * Spawning with the wrong cwd — pass `cwd` explicitly
+* Overlapping-write fan-out without `own` globs — agents clobber each other's files
+* Sharing a serialized resource (test runner, port) without `exclusive` — races
+* Long fan-outs with no `task_create` instruction — you fly blind until `agent_end`
