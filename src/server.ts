@@ -480,6 +480,18 @@ async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fai
       if (!pattern) {
         return hostResult(id, { error: "exclusive_acquire requires a `pattern` argument" }, true);
       }
+      if (pattern.startsWith("room:")) {
+        return hostResult(
+          id,
+          {
+            error: {
+              code: "reserved_pattern",
+              message: "room:* patterns are reserved for the Room engine",
+            },
+          },
+          true,
+        );
+      }
       const acquired = registry.acquireExclusive(pattern, agentId);
       void notify(
         "notifications/claude/channel",
